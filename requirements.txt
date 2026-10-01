@@ -2,4 +2,5 @@ streamlit
 pandas
 pydeck
 pyecharts
-geopandas
+pyshp
+pyproj
