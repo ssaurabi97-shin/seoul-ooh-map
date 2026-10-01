@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import pydeck as pdk
+import re
 
 st.set_page_config(page_title="서울시 OOH 타겟 생활인구 지도", layout="wide")
 
@@ -25,7 +26,7 @@ if uploaded_file is not None:
     # 1. 시간대 선택 (08시~23시)
     start_hour, end_hour = st.sidebar.slider("시간대 범위 (시)", 0, 23, (8, 23))
     
-    # 2. 성별 선택 기능 추가 (남성, 여성)
+    # 2. 성별 선택
     st.sidebar.subheader("1. 성별 선택")
     selected_genders = st.sidebar.multiselect(
         "분석할 성별을 선택하세요",
@@ -33,32 +34,39 @@ if uploaded_file is not None:
         default=["여성"]
     )
     
-    # 선택된 성별 키워드 추출
-    target_keywords = []
-    if "남성" in selected_genders:
-        target_keywords.extend(['남자', '남성'])
-    if "여성" in selected_genders:
-        target_keywords.extend(['여자', '여성'])
-        
-    # 성별 선택에 맞게 데이터 컬럼 자동 필터링
-    available_cols = [
-        col for col in df.columns 
-        if any(keyword in col for keyword in target_keywords)
-    ]
+    # 데이터 컬럼에서 성별 키워드를 제거하고 순수 연령대 목록만 자동 추출
+    all_cols = df.columns.tolist()
+    extracted_ages = []
+    for col in all_cols:
+        if any(keyword in col for keyword in ['남자', '여자', '남성', '여성']):
+            cleaned = re.sub(r'남자|여자|남성|여성', '', col).strip()
+            if cleaned and cleaned not in extracted_ages:
+                extracted_ages.append(cleaned)
     
-    # 기본 선택값 (2039 타겟) 자동 추출
-    default_selected = [
-        c for c in available_cols 
-        if any(age in c for age in ['20~24세', '25~29세', '30~34세', '35~39세'])
-    ]
+    # 기본 선택값 (20~39세)
+    default_ages = [a for a in extracted_ages if any(age in a for age in ['20~24', '25~29', '30~34', '35~39'])]
     
-    # 3. 세부 연령대 컬럼 선택
+    # 3. 세부 연령대 선택 (성별 표시 없이 순수 연령대만 표시)
     st.sidebar.subheader("2. 세부 연령대 선택")
-    selected_cols = st.sidebar.multiselect(
-        "분석할 성/연령대 컬럼 선택", 
-        options=available_cols,
-        default=default_selected if default_selected else available_cols[:4]
+    selected_ages = st.sidebar.multiselect(
+        "분석할 연령대를 선택하세요", 
+        options=extracted_ages,
+        default=default_ages if default_ages else extracted_ages[:4]
     )
+    
+    # 선택된 성별 + 연령대에 매칭되는 실제 데이터 컬럼 추출
+    gender_keywords = []
+    if "남성" in selected_genders:
+        gender_keywords.extend(['남자', '남성'])
+    if "여성" in selected_genders:
+        gender_keywords.extend(['여자', '여성'])
+        
+    selected_cols = []
+    for col in all_cols:
+        has_gender = any(gk in col for gk in gender_keywords)
+        has_age = any(ak in col for ak in selected_ages)
+        if has_gender and has_age:
+            selected_cols.append(col)
     
     # 데이터 필터링 및 집계
     df_filtered = df[(df['시간'] >= start_hour) & (df['시간'] <= end_hour)].copy()
@@ -75,8 +83,9 @@ if uploaded_file is not None:
         grid_summary = df_filtered.groupby('250M격자')['target_sum'].mean().reset_index()
         
         st.subheader("📊 격자별 타겟 유동인구 상위 지역")
+        st.caption(f"✓ 현재 포함된 데이터 컬럼: {', '.join(selected_cols)}")
         st.dataframe(grid_summary.sort_values(by='target_sum', ascending=False).head(20))
         
-        st.info("💡 성별 선택(남성/여성) 변경 시 하단의 세부 연령대 선택 옵션이 즉시 업데이트됩니다.")
+        st.info("💡 성별과 연령대를 각각 독립적으로 클릭하여 자유롭게 조건 조합을 변경할 수 있습니다.")
     else:
-        st.warning("⚠️ 최소 하나 이상의 성별과 세부 연령대 컬럼을 선택해 주세요.")
+        st.warning("⚠️️ 최소 하나 이상의 성별과 연령대를 각각 선택해 주세요.")
