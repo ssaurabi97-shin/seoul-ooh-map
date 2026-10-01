@@ -15,6 +15,7 @@ st.title("🗺️ 서울시 250m 격자 타겟 생활인구 3D 지도 분석")
 st.write("2024년 이후 일별 CSV 데이터를 DB에 누적 저장하고, 타겟 조건별 유동인구 밀집도를 정밀 시각화합니다.")
 
 DB_PATH = "seoul_population.db"
+COORDS_PATH = "grid_coords.csv"
 
 def get_db_connection():
     return sqlite3.connect(DB_PATH)
@@ -27,139 +28,179 @@ def ensure_index():
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_date_time ON raw_population (일자, 시간)")
         conn.commit()
     except Exception:
-        pass  # 테이블이 아직 생성되지 않은 경우 예외 처리
+        pass
     finally:
         conn.close()
 
 # ===================================================================
-# --- 사이드바: 1. 데이터 및 공간 격자 업로드 ---
+# --- 데이터 및 좌표 상태 확인 함수 ---
 # ===================================================================
-st.sidebar.header("📂 1. 데이터 & 공간 격자 업로드")
-
-# 1-1. 인구 데이터 CSV 업로드
-st.sidebar.subheader("📄 일별 생활인구 CSV")
-uploaded_files = st.sidebar.file_uploader(
-    "일별 250M CSV 파일들을 올려주세요 (다중 선택 가능)", 
-    type=["csv"], 
-    accept_multiple_files=True
-)
-
-if uploaded_files:
-    if st.sidebar.button("💾 DB에 원본 데이터 누적 저장하기", use_container_width=True):
+def get_db_status():
+    if not os.path.exists(DB_PATH):
+        return False, 0, []
+    try:
         conn = get_db_connection()
-        total_rows = 0
-        
-        with st.spinner("데이터베이스에 저장 중입니다..."):
-            for uploaded_file in uploaded_files:
-                try:
-                    df = pd.read_csv(uploaded_file, encoding='euc-kr')
-                except Exception:
-                    df = pd.read_csv(uploaded_file, encoding='utf-8')
-                
-                df.to_sql('raw_population', conn, if_exists='append', index=False)
-                total_rows += len(df)
-                
+        count_df = pd.read_sql("SELECT COUNT(*) as cnt FROM raw_population", conn)
+        dates_df = pd.read_sql("SELECT DISTINCT 일자 FROM raw_population ORDER BY 일자", conn)
         conn.close()
-        ensure_index()
-        st.sidebar.success(f"총 {len(uploaded_files)}개 파일 ({total_rows:,}행) DB 저장 완료!")
+        total_cnt = count_df['cnt'].iloc[0]
+        date_list = dates_df['일자'].astype(str).tolist()
+        return True, total_cnt, date_list
+    except Exception:
+        return False, 0, []
 
-# 1-2. 격자 Shapefile (.zip) 동적 업로드 & 좌표 추출 (pyshp 기반 초경량화)
-st.sidebar.markdown("---")
-st.sidebar.subheader("📐 격자 공간 데이터 (Shapefile)")
-shapefile_zip = st.sidebar.file_uploader(
-    "서울시 격자 Shapefile 패키지 (.zip) 업로드", 
-    type=["zip"]
-)
+def get_coords_status():
+    if os.path.exists(COORDS_PATH):
+        try:
+            df = pd.read_csv(COORDS_PATH)
+            return True, len(df)
+        except Exception:
+            return False, 0
+    return False, 0
 
-if shapefile_zip:
-    if st.sidebar.button("⚙️ 공간 데이터에서 위경도 좌표 추출하기", use_container_width=True):
-        with st.spinner("Shapefile 파싱 및 위경도 좌표 변환 중..."):
-            try:
-                with tempfile.TemporaryDirectory() as tmp_dir:
-                    zip_path = os.path.join(tmp_dir, "grid_upload.zip")
-                    with open(zip_path, "wb") as f:
-                        f.write(shapefile_zip.getbuffer())
+# ===================================================================
+# --- 사이드바: 1. 데이터 현황 및 누적 관리 ---
+# ===================================================================
+st.sidebar.header("📂 1. 저장된 데이터 현황")
+
+has_db, db_row_count, available_dates = get_db_status()
+has_coords, coords_count = get_coords_status()
+
+# 현재 상태 요약 표시
+if has_db and db_row_count > 0:
+    st.sidebar.success(f"💾 **인구 DB:** 총 {db_row_count:,}행 ({len(available_dates)}개 일자 누적됨)")
+else:
+    st.sidebar.warning("💾 **인구 DB:** 데이터 없음 (CSV 업로드 필요)")
+
+if has_coords and coords_count > 0:
+    st.sidebar.success(f"📐 **격자 좌표:** {coords_count:,}개 격자 좌표 준비 완료")
+else:
+    st.sidebar.warning("📐 **격자 좌표:** 데이터 없음 (Shapefile 업로드 필요)")
+
+# 접이식 신규 파일 업로드 섹션 (매번 업로드할 필요 없도록 접어둠)
+with st.sidebar.expander("➕ 신규 데이터 추가 / 좌표 업데이트"):
+    st.markdown("#### 📄 일별 생활인구 CSV 추가")
+    uploaded_files = st.file_uploader(
+        "추가할 CSV 파일들을 올려주세요", 
+        type=["csv"], 
+        accept_multiple_files=True,
+        key="csv_uploader"
+    )
+
+    if uploaded_files:
+        if st.button("💾 DB에 추가 누적 저장하기", use_container_width=True):
+            conn = get_db_connection()
+            total_rows = 0
+            
+            with st.spinner("데이터베이스에 추가 저장 중입니다..."):
+                for uploaded_file in uploaded_files:
+                    try:
+                        df = pd.read_csv(uploaded_file, encoding='euc-kr')
+                    except Exception:
+                        df = pd.read_csv(uploaded_file, encoding='utf-8')
                     
-                    # 1. zip 압축 해제
-                    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-                        zip_ref.extractall(tmp_dir)
+                    df.to_sql('raw_population', conn, if_exists='append', index=False)
+                    total_rows += len(df)
                     
-                    # 2. .shp 파일 경로 및 .prj (좌표계 정의) 파일 찾기
-                    shp_path = None
-                    prj_path = None
-                    for root, dirs, files in os.walk(tmp_dir):
-                        for file in files:
-                            if file.endswith('.shp'):
-                                shp_path = os.path.join(root, file)
-                            elif file.endswith('.prj'):
-                                prj_path = os.path.join(root, file)
-                    
-                    if not shp_path:
-                        st.sidebar.error("⚠️ .zip 파일 내에서 .shp 파일을 찾을 수 없습니다.")
-                    else:
-                        # 3. 좌표 변환기 설정 (기본: EPSG:5181 -> EPSG:4326 위경도)
-                        src_crs = "EPSG:5181" # 한국 기본 TM 좌표계
-                        if prj_path:
-                            try:
-                                with open(prj_path, 'r', encoding='utf-8', errors='ignore') as pf:
-                                    prj_txt = pf.read()
-                                    if "5179" in prj_txt or "UTM-K" in prj_txt:
-                                        src_crs = "EPSG:5179"
-                                    elif "5181" in prj_txt or "Central Belt" in prj_txt:
-                                        src_crs = "EPSG:5181"
-                                    elif "5186" in prj_txt:
-                                        src_crs = "EPSG:5186"
-                            except Exception:
-                                pass
+            conn.close()
+            ensure_index()
+            st.success(f"총 {len(uploaded_files)}개 파일 ({total_rows:,}행) DB 추가 저장 완료!")
+            st.rerun()
+
+    st.markdown("---")
+    st.markdown("#### 📐 격자 Shapefile (.zip) 업로드")
+    shapefile_zip = st.file_uploader(
+        "서울시 격자 Shapefile 패키지 (.zip)", 
+        type=["zip"],
+        key="zip_uploader"
+    )
+
+    if shapefile_zip:
+        if st.button("⚙️ 위경도 좌표 재생성하기", use_container_width=True):
+            with st.spinner("Shapefile 파싱 및 위경도 좌표 변환 중..."):
+                try:
+                    with tempfile.TemporaryDirectory() as tmp_dir:
+                        zip_path = os.path.join(tmp_dir, "grid_upload.zip")
+                        with open(zip_path, "wb") as f:
+                            f.write(shapefile_zip.getbuffer())
                         
-                        transformer = Transformer.from_crs(src_crs, "EPSG:4326", always_xy=True)
+                        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                            zip_ref.extractall(tmp_dir)
                         
-                        # 4. Shapefile 읽기 및 중심점 계산
-                        sf = shapefile.Reader(shp_path)
-                        fields = [f[0] for f in sf.fields[1:]]
+                        shp_path = None
+                        prj_path = None
+                        for root, dirs, files in os.walk(tmp_dir):
+                            for file in files:
+                                if file.endswith('.shp'):
+                                    shp_path = os.path.join(root, file)
+                                elif file.endswith('.prj'):
+                                    prj_path = os.path.join(root, file)
                         
-                        # 격자 ID 컬럼 탐지
-                        grid_col_idx = next((i for i, c in enumerate(fields) if '격자' in c or 'GRID' in c.upper() or 'ID' in c.upper()), 0)
-                        
-                        grid_records = []
-                        for shape_rec in sf.shapeRecords():
-                            grid_id = shape_rec.record[grid_col_idx]
-                            bbox = shape_rec.shape.bbox  # [minx, miny, maxx, maxy]
+                        if not shp_path:
+                            st.error("⚠️️ .zip 파일 내에서 .shp 파일을 찾을 수 없습니다.")
+                        else:
+                            src_crs = "EPSG:5181"
+                            if prj_path:
+                                try:
+                                    with open(prj_path, 'r', encoding='utf-8', errors='ignore') as pf:
+                                        prj_txt = pf.read()
+                                        if "5179" in prj_txt or "UTM-K" in prj_txt:
+                                            src_crs = "EPSG:5179"
+                                        elif "5181" in prj_txt or "Central Belt" in prj_txt:
+                                            src_crs = "EPSG:5181"
+                                        elif "5186" in prj_txt:
+                                            src_crs = "EPSG:5186"
+                                except Exception:
+                                    pass
                             
-                            # 바운딩 박스 중심점 계산
-                            center_x = (bbox[0] + bbox[2]) / 2.0
-                            center_y = (bbox[1] + bbox[3]) / 2.0
+                            transformer = Transformer.from_crs(src_crs, "EPSG:4326", always_xy=True)
                             
-                            # WGS84 위경도로 투영 변환
-                            lon, lat = transformer.transform(center_x, center_y)
+                            sf = shapefile.Reader(shp_path)
+                            fields = [f[0] for f in sf.fields[1:]]
+                            grid_col_idx = next((i for i, c in enumerate(fields) if '격자' in c or 'GRID' in c.upper() or 'ID' in c.upper()), 0)
                             
-                            grid_records.append({
-                                '250M격자': str(grid_id),
-                                'lat': lat,
-                                'lon': lon
-                            })
-                        
-                        coords_df = pd.DataFrame(grid_records).drop_duplicates()
-                        coords_df.to_csv("grid_coords.csv", index=False, encoding='utf-8-sig')
-                        st.sidebar.success(f"✅ 총 {len(coords_df):,}개 격자의 좌표(`grid_coords.csv`) 추출 완료!")
-                        
-            except Exception as e:
-                st.sidebar.error(f"❌ 파일 처리 중 오류 발생: {e}")
+                            grid_records = []
+                            for shape_rec in sf.shapeRecords():
+                                grid_id = shape_rec.record[grid_col_idx]
+                                bbox = shape_rec.shape.bbox
+                                center_x = (bbox[0] + bbox[2]) / 2.0
+                                center_y = (bbox[1] + bbox[3]) / 2.0
+                                lon, lat = transformer.transform(center_x, center_y)
+                                grid_records.append({
+                                    '250M격자': str(grid_id),
+                                    'lat': lat,
+                                    'lon': lon
+                                })
+                            
+                            coords_df = pd.DataFrame(grid_records).drop_duplicates()
+                            coords_df.to_csv(COORDS_PATH, index=False, encoding='utf-8-sig')
+                            st.success(f"✅ 총 {len(coords_df):,}개 격자의 좌표 추출 완료!")
+                            st.rerun()
+                            
+                except Exception as e:
+                    st.error(f"❌ 파일 처리 중 오류 발생: {e}")
+
+# 데이터 초기화 옵션
+with st.sidebar.expander("🛠️ 데이터 초기화 / 관리"):
+    st.caption("저장된 DB 및 좌표 파일을 초기화하고 처음 상태로 되돌립니다.")
+    if st.button("🗑️ 전체 저장 데이터 삭제", use_container_width=True):
+        if os.path.exists(DB_PATH):
+            os.remove(DB_PATH)
+        if os.path.exists(COORDS_PATH):
+            os.remove(COORDS_PATH)
+        st.success("저장된 데이터가 삭제되었습니다.")
+        st.rerun()
 
 # ===================================================================
 # --- DB 데이터 메타데이터 읽기 ---
 # ===================================================================
 all_cols = []
-available_dates = []
 
-if os.path.exists(DB_PATH):
+if has_db:
     try:
         conn = get_db_connection()
         sample_df = pd.read_sql("SELECT * FROM raw_population LIMIT 1", conn)
         all_cols = sample_df.columns.tolist()
-        
-        dates_df = pd.read_sql("SELECT DISTINCT 일자 FROM raw_population ORDER BY 일자", conn)
-        available_dates = dates_df['일자'].astype(str).tolist()
         conn.close()
     except Exception:
         pass
@@ -184,7 +225,7 @@ with st.sidebar.form(key="filter_form"):
         selected_dates = st.multiselect("분석 일자 선택", options=available_dates, default=available_dates[-1:])
     else:
         selected_dates = []
-        st.info("먼저 CSV 파일을 업로드해 주세요.")
+        st.info("먼저 데이터를 업로드해 주세요.")
         
     start_hour, end_hour = st.slider("시간대 범위 (시)", 0, 23, (8, 23))
     selected_genders = st.multiselect("성별 선택", ["남성", "여성"], default=["여성"])
@@ -236,16 +277,16 @@ if submit_button:
                 grid_summary = df_res.groupby('250M격자')['target_sum'].mean().reset_index()
                 grid_summary['250M격자'] = grid_summary['250M격자'].astype(str)
                 
-                # 좌표 데이터 매핑 (grid_coords.csv 활용)
-                if os.path.exists("grid_coords.csv"):
-                    coords_df = pd.read_csv("grid_coords.csv")
+                # 좌표 데이터 매핑
+                if os.path.exists(COORDS_PATH):
+                    coords_df = pd.read_csv(COORDS_PATH)
                     coords_df['250M격자'] = coords_df['250M격자'].astype(str)
                     map_df = pd.merge(grid_summary, coords_df, on="250M격자", how="inner")
                 else:
                     map_df = grid_summary.copy()
                     map_df['lat'] = 37.5665
                     map_df['lon'] = 126.9780
-                    st.warning("⚠️ `grid_coords.csv` 파일이 없습니다. 사이드바의 '1-2. 격자 공간 데이터'에서 Shapefile (.zip)을 올려 좌표를 생성해 주세요.")
+                    st.warning("⚠️️ 격자 좌표 파일이 없습니다. 사이드바의 '신규 데이터 추가' 메뉴에서 Shapefile(.zip)을 올려 좌표를 생성해 주세요.")
 
                 if map_df.empty:
                     st.error("⚠️ 인구 데이터와 좌표 데이터 간 일치하는 격자 ID가 없습니다.")
