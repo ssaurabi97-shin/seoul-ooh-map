@@ -300,14 +300,17 @@ if submit_button:
                     st.error("⚠️ 인구 데이터와 좌표 데이터 간 일치하는 격자 ID가 없습니다.")
                 else:
                     # ===================================================================
-                    # --- 상대 분위수(Quantile) 기반 5단계 매핑 & 직관적 핫스팟 팔레트 적용 ---
+                    # --- 상대 분위수(Quantile) 기반 5단계 매핑 (Categorical 에러 방지 처리) ---
                     # ===================================================================
                     try:
                         map_df['grade'] = pd.qcut(map_df['target_sum'], q=5, labels=[1, 2, 3, 4, 5], duplicates='drop')
                     except Exception:
                         map_df['grade'] = pd.qcut(map_df['target_sum'].rank(method='first'), q=5, labels=[1, 2, 3, 4, 5])
                     
-                    # 5단계 RGB 색상 및 레이블 명시
+                    # 1. Categorical 타입을 명시적 정수형(int)으로 변환
+                    map_df['grade'] = map_df['grade'].astype(int)
+                    
+                    # 2. 5단계 RGB 색상 정의
                     color_map = {
                         1: [144, 202, 249, 200], # 1단계 (하위 0~20%): 연한 하늘색
                         2: [139, 195, 74, 200],  # 2단계 (20~40%): 밝은 연두색
@@ -316,7 +319,8 @@ if submit_button:
                         5: [213, 0, 0, 220]      # 5단계 (상위 80~100%): 자줏빛 빨강 (핫스팟)
                     }
                     
-                    map_df['color'] = map_df['grade'].map(color_map)
+                    # 3. 리스트 컴프리헨션으로 안전하게 색상 매핑
+                    map_df['color'] = [color_map[g] for g in map_df['grade']]
 
                     # 지도 뷰 및 테마 설정
                     mid_lat = map_df['lat'].mean()
