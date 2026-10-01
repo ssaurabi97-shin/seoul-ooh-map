@@ -235,7 +235,7 @@ with st.sidebar.form(key="filter_form"):
     map_type = st.radio("표현 방식", ["2D 도트 지도 (Scatter)", "3D 기둥 (Column)", "2D 번짐 열지도 (Heatmap)"])
     
     # 도트 크기 조절 슬라이더
-    dot_radius = st.slider("도트 크기 / 반지름 (픽셀)", min_value=1, max_value=25, value=3, help="축소 시 2~4px 설정 권장")
+    dot_radius = st.slider("도트 크기 / 반지름 (픽셀)", min_value=1, max_value=20, value=3, help="축소 시 2~4px 설정 권장")
     
     # 지도 배경 스타일 선택
     map_style_choice = st.selectbox("지도 배경 스타일", ["밝은 지도 (Light)", "어두운 지도 (Dark)"])
@@ -299,21 +299,28 @@ if submit_button:
                 if map_df.empty:
                     st.error("⚠️ 인구 데이터와 좌표 데이터 간 일치하는 격자 ID가 없습니다.")
                 else:
-                    # 동적 정규화 및 색상 매핑 (노란색 -> 주황색 -> 빨간색)
-                    max_val = map_df['target_sum'].max() if map_df['target_sum'].max() > 0 else 1
-                    map_df['norm'] = map_df['target_sum'] / max_val
+                    # ===================================================================
+                    # --- 상대 분위수(Quantile) 기반 5단계 매핑 & 직관적 핫스팟 팔레트 적용 ---
+                    # ===================================================================
+                    try:
+                        map_df['grade'] = pd.qcut(map_df['target_sum'], q=5, labels=[1, 2, 3, 4, 5], duplicates='drop')
+                    except Exception:
+                        map_df['grade'] = pd.qcut(map_df['target_sum'].rank(method='first'), q=5, labels=[1, 2, 3, 4, 5])
                     
-                    # RGB 색상 계산
-                    map_df['r'] = 255
-                    map_df['g'] = (255 * (1 - map_df['norm'] ** 0.5)).astype(int)
-                    map_df['b'] = 0
-                    map_df['a'] = 200
-                    map_df['color'] = map_df.apply(lambda row: [row['r'], row['g'], row['b'], row['a']], axis=1)
+                    # 5단계 RGB 색상 및 레이블 명시
+                    color_map = {
+                        1: [144, 202, 249, 200], # 1단계 (하위 0~20%): 연한 하늘색
+                        2: [139, 195, 74, 200],  # 2단계 (20~40%): 밝은 연두색
+                        3: [255, 235, 59, 200],  # 3단계 (40~60%): 선명한 노란색
+                        4: [255, 152, 0, 200],   # 4단계 (60~80%): 진한 주황색
+                        5: [213, 0, 0, 220]      # 5단계 (상위 80~100%): 자줏빛 빨강 (핫스팟)
+                    }
+                    
+                    map_df['color'] = map_df['grade'].map(color_map)
 
                     # 지도 뷰 및 테마 설정
                     mid_lat = map_df['lat'].mean()
                     mid_lon = map_df['lon'].mean()
-                    
                     map_style = "light" if "Light" in map_style_choice else "dark"
                     
                     view_state = pdk.ViewState(
@@ -323,9 +330,8 @@ if submit_button:
                         pitch=45 if "3D" in map_type else 0
                     )
                     
-                    # 표현 방식 선택에 따른 PyDeck 레이어 구성
+                    # PyDeck 레이어 구성
                     if "Scatter" in map_type:
-                        # 샘플 사진 스타일: 선명하게 점 하나하나 표현
                         layer = pdk.Layer(
                             "ScatterplotLayer",
                             data=map_df,
@@ -348,7 +354,7 @@ if submit_button:
                             pickable=True,
                             auto_highlight=True
                         )
-                    else: # Heatmap
+                    else:
                         layer = pdk.Layer(
                             "HeatmapLayer",
                             data=map_df,
@@ -363,10 +369,22 @@ if submit_button:
                         layers=[layer],
                         initial_view_state=view_state,
                         map_style=map_style,
-                        tooltip={"html": "<b>격자 ID:</b> {250M격자}<br/><b>평균 타겟 인구:</b> {target_sum:.1f}명"}
+                        tooltip={"html": "<b>격자 ID:</b> {250M격자}<br/><b>평균 타겟 인구:</b> {target_sum:.1f}명 (<b>{grade}단계</b>)"}
                     )
                     
                     st.subheader("🗺️ 서울시 250m 격자 타겟 생활인구 지도")
+                    
+                    # --- 5단계 범례(Legend) 표시 ---
+                    st.markdown("""
+                    <div style="display: flex; gap: 10px; margin-bottom: 12px; font-weight: bold; font-size: 13px;">
+                        <span style="background-color: #90CAF9; color: #000; padding: 4px 8px; border-radius: 4px;">🔵 1단계 (0~20%)</span>
+                        <span style="background-color: #8BC34A; color: #000; padding: 4px 8px; border-radius: 4px;">🟢 2단계 (20~40%)</span>
+                        <span style="background-color: #FFEB3B; color: #000; padding: 4px 8px; border-radius: 4px;">🟡 3단계 (40~60%)</span>
+                        <span style="background-color: #FF9800; color: #fff; padding: 4px 8px; border-radius: 4px;">🟠 4단계 (60~80%)</span>
+                        <span style="background-color: #D50000; color: #fff; padding: 4px 8px; border-radius: 4px;">🔴 5단계 (핫스팟 80~100%)</span>
+                    </div>
+                    """, unsafe_allow_html=True)
+                    
                     st.pydeck_chart(deck)
                     
                     st.subheader("📊 타겟 유동인구 상위 20개 격자")
