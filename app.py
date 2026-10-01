@@ -66,7 +66,6 @@ st.sidebar.header("📂 1. 저장된 데이터 현황")
 has_db, db_row_count, available_dates = get_db_status()
 has_coords, coords_count = get_coords_status()
 
-# 현재 상태 요약 표시
 if has_db and db_row_count > 0:
     st.sidebar.success(f"💾 **인구 DB:** 총 {db_row_count:,}행 ({len(available_dates)}개 일자 누적됨)")
 else:
@@ -77,7 +76,7 @@ if has_coords and coords_count > 0:
 else:
     st.sidebar.warning("📐 **격자 좌표:** 데이터 없음 (Shapefile 업로드 필요)")
 
-# 접이식 신규 파일 업로드 섹션 (매번 업로드할 필요 없도록 접어둠)
+# 접이식 신규 파일 업로드 섹션
 with st.sidebar.expander("➕ 신규 데이터 추가 / 좌표 업데이트"):
     st.markdown("#### 📄 일별 생활인구 CSV 추가")
     uploaded_files = st.file_uploader(
@@ -137,7 +136,7 @@ with st.sidebar.expander("➕ 신규 데이터 추가 / 좌표 업데이트"):
                                     prj_path = os.path.join(root, file)
                         
                         if not shp_path:
-                            st.error("⚠️️ .zip 파일 내에서 .shp 파일을 찾을 수 없습니다.")
+                            st.error("⚠️ .zip 파일 내에서 .shp 파일을 찾을 수 없습니다.")
                         else:
                             src_crs = "EPSG:5181"
                             if prj_path:
@@ -230,7 +229,16 @@ with st.sidebar.form(key="filter_form"):
     start_hour, end_hour = st.slider("시간대 범위 (시)", 0, 23, (8, 23))
     selected_genders = st.multiselect("성별 선택", ["남성", "여성"], default=["여성"])
     selected_ages = st.multiselect("연령대 선택", options=extracted_ages, default=default_ages if default_ages else extracted_ages[:4])
-    map_type = st.radio("지도 시각화 방식", ["3D 기둥 (Column)", "2D 히트맵 (Heatmap)"])
+    
+    st.markdown("---")
+    st.subheader("🎨 지도 시각화 옵션")
+    map_type = st.radio("표현 방식", ["2D 도트 지도 (Scatter)", "3D 기둥 (Column)", "2D 번짐 열지도 (Heatmap)"])
+    
+    # 도트 크기 조절 슬라이더
+    dot_radius = st.slider("도트 크기 / 반지름 (픽셀)", min_value=1, max_value=25, value=3, help="축소 시 2~4px 설정 권장")
+    
+    # 지도 배경 스타일 선택
+    map_style_choice = st.selectbox("지도 배경 스타일", ["밝은 지도 (Light)", "어두운 지도 (Dark)"])
     
     submit_button = st.form_submit_button(label="🔍 데이터 분석 & 지도 생성", use_container_width=True)
 
@@ -286,33 +294,49 @@ if submit_button:
                     map_df = grid_summary.copy()
                     map_df['lat'] = 37.5665
                     map_df['lon'] = 126.9780
-                    st.warning("⚠️️ 격자 좌표 파일이 없습니다. 사이드바의 '신규 데이터 추가' 메뉴에서 Shapefile(.zip)을 올려 좌표를 생성해 주세요.")
+                    st.warning("⚠️ 격자 좌표 파일이 없습니다. 사이드바의 '신규 데이터 추가' 메뉴에서 Shapefile(.zip)을 올려 좌표를 생성해 주세요.")
 
                 if map_df.empty:
                     st.error("⚠️ 인구 데이터와 좌표 데이터 간 일치하는 격자 ID가 없습니다.")
                 else:
-                    # 동적 색상 매핑
+                    # 동적 정규화 및 색상 매핑 (노란색 -> 주황색 -> 빨간색)
                     max_val = map_df['target_sum'].max() if map_df['target_sum'].max() > 0 else 1
                     map_df['norm'] = map_df['target_sum'] / max_val
                     
-                    map_df['r'] = (255 * map_df['norm']).astype(int)
-                    map_df['g'] = (255 * (1 - map_df['norm'] * 0.8)).astype(int)
-                    map_df['b'] = 50
+                    # RGB 색상 계산
+                    map_df['r'] = 255
+                    map_df['g'] = (255 * (1 - map_df['norm'] ** 0.5)).astype(int)
+                    map_df['b'] = 0
                     map_df['a'] = 200
                     map_df['color'] = map_df.apply(lambda row: [row['r'], row['g'], row['b'], row['a']], axis=1)
 
-                    # 지도 뷰 설정
+                    # 지도 뷰 및 테마 설정
                     mid_lat = map_df['lat'].mean()
                     mid_lon = map_df['lon'].mean()
+                    
+                    map_style = "light" if "Light" in map_style_choice else "dark"
                     
                     view_state = pdk.ViewState(
                         latitude=mid_lat,
                         longitude=mid_lon,
                         zoom=11,
-                        pitch=45 if map_type.startswith("3D") else 0
+                        pitch=45 if "3D" in map_type else 0
                     )
                     
-                    if map_type.startswith("3D"):
+                    # 표현 방식 선택에 따른 PyDeck 레이어 구성
+                    if "Scatter" in map_type:
+                        # 샘플 사진 스타일: 선명하게 점 하나하나 표현
+                        layer = pdk.Layer(
+                            "ScatterplotLayer",
+                            data=map_df,
+                            get_position=["lon", "lat"],
+                            get_fill_color="color",
+                            radius_min_pixels=dot_radius,
+                            radius_max_pixels=dot_radius * 2,
+                            pickable=True,
+                            opacity=0.85
+                        )
+                    elif "3D" in map_type:
                         layer = pdk.Layer(
                             "ColumnLayer",
                             data=map_df,
@@ -324,18 +348,21 @@ if submit_button:
                             pickable=True,
                             auto_highlight=True
                         )
-                    else:
+                    else: # Heatmap
                         layer = pdk.Layer(
                             "HeatmapLayer",
                             data=map_df,
                             get_position=["lon", "lat"],
                             get_weight="target_sum",
-                            radius_pixels=25
+                            radius_pixels=dot_radius * 2,
+                            intensity=1,
+                            threshold=0.05
                         )
                     
                     deck = pdk.Deck(
                         layers=[layer],
                         initial_view_state=view_state,
+                        map_style=map_style,
                         tooltip={"html": "<b>격자 ID:</b> {250M격자}<br/><b>평균 타겟 인구:</b> {target_sum:.1f}명"}
                     )
                     
