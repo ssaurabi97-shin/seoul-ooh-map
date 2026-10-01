@@ -2,11 +2,12 @@ import streamlit as st
 import pandas as pd
 import sqlite3
 import pydeck as pdk
-import geopandas as gpd
 import re
 import os
 import tempfile
 import zipfile
+import shapefile
+from pyproj import Transformer
 
 st.set_page_config(page_title="서울시 OOH 타겟 생활인구 지도", layout="wide")
 
@@ -62,7 +63,7 @@ if uploaded_files:
         ensure_index()
         st.sidebar.success(f"총 {len(uploaded_files)}개 파일 ({total_rows:,}행) DB 저장 완료!")
 
-# 1-2. 격자 Shapefile (.zip) 동적 업로드 & 좌표 추출 (에러 처리 강화)
+# 1-2. 격자 Shapefile (.zip) 동적 업로드 & 좌표 추출 (pyshp 기반 초경량화)
 st.sidebar.markdown("---")
 st.sidebar.subheader("📐 격자 공간 데이터 (Shapefile)")
 shapefile_zip = st.sidebar.file_uploader(
@@ -83,41 +84,65 @@ if shapefile_zip:
                     with zipfile.ZipFile(zip_path, 'r') as zip_ref:
                         zip_ref.extractall(tmp_dir)
                     
-                    # 2. 압축 파일 내 하위 폴더까지 탐색하여 .shp 파일 찾기
-                    shp_files = [
-                        os.path.join(root, file)
-                        for root, dirs, files in os.walk(tmp_dir)
-                        for file in files if file.endswith('.shp')
-                    ]
+                    # 2. .shp 파일 경로 및 .prj (좌표계 정의) 파일 찾기
+                    shp_path = None
+                    prj_path = None
+                    for root, dirs, files in os.walk(tmp_dir):
+                        for file in files:
+                            if file.endswith('.shp'):
+                                shp_path = os.path.join(root, file)
+                            elif file.endswith('.prj'):
+                                prj_path = os.path.join(root, file)
                     
-                    if not shp_files:
+                    if not shp_path:
                         st.sidebar.error("⚠️ .zip 파일 내에서 .shp 파일을 찾을 수 없습니다.")
                     else:
-                        shp_path = shp_files[0]
-                        gdf = gpd.read_file(shp_path)
+                        # 3. 좌표 변환기 설정 (기본: EPSG:5181 -> EPSG:4326 위경도)
+                        src_crs = "EPSG:5181" # 한국 기본 TM 좌표계
+                        if prj_path:
+                            try:
+                                with open(prj_path, 'r', encoding='utf-8', errors='ignore') as pf:
+                                    prj_txt = pf.read()
+                                    if "5179" in prj_txt or "UTM-K" in prj_txt:
+                                        src_crs = "EPSG:5179"
+                                    elif "5181" in prj_txt or "Central Belt" in prj_txt:
+                                        src_crs = "EPSG:5181"
+                                    elif "5186" in prj_txt:
+                                        src_crs = "EPSG:5186"
+                            except Exception:
+                                pass
                         
-                        # 3. 좌표계(CRS) 검증 및 WGS84(EPSG:4326) 변환
-                        if gdf.crs is None:
-                            # 좌표계 정보가 없는 경우 한국 기본 좌표계(EPSG:5181) 지정
-                            gdf.set_crs(epsg=5181, inplace=True)
+                        transformer = Transformer.from_crs(src_crs, "EPSG:4326", always_xy=True)
+                        
+                        # 4. Shapefile 읽기 및 중심점 계산
+                        sf = shapefile.Reader(shp_path)
+                        fields = [f[0] for f in sf.fields[1:]]
+                        
+                        # 격자 ID 컬럼 탐지
+                        grid_col_idx = next((i for i, c in enumerate(fields) if '격자' in c or 'GRID' in c.upper() or 'ID' in c.upper()), 0)
+                        
+                        grid_records = []
+                        for shape_rec in sf.shapeRecords():
+                            grid_id = shape_rec.record[grid_col_idx]
+                            bbox = shape_rec.shape.bbox  # [minx, miny, maxx, maxy]
                             
-                        gdf_4326 = gdf.to_crs(epsg=4326)
-                        
-                        # 4. 격자 중심점(Centroid) 계산하여 위도/경도 추출
-                        gdf_4326['lon'] = gdf_4326.geometry.centroid.x
-                        gdf_4326['lat'] = gdf_4326.geometry.centroid.y
-                        
-                        # 5. 격자 ID 컬럼 탐지 (250M격자, GRID, ID 등)
-                        grid_col = next((c for c in gdf_4326.columns if '격자' in c or 'GRID' in c.upper() or 'ID' in c.upper()), None)
-                        
-                        if grid_col:
-                            gdf_4326 = gdf_4326.rename(columns={grid_col: '250M격자'})
-                            coords_df = gdf_4326[['250M격자', 'lat', 'lon']].drop_duplicates()
-                            coords_df.to_csv("grid_coords.csv", index=False, encoding='utf-8-sig')
-                            st.sidebar.success(f"✅ 총 {len(coords_df):,}개 격자의 좌표(`grid_coords.csv`) 추출 완료!")
-                        else:
-                            st.sidebar.error(f"⚠️ 격자 ID 컬럼을 찾을 수 없습니다. (발견된 컬럼: {list(gdf_4326.columns)})")
+                            # 바운딩 박스 중심점 계산
+                            center_x = (bbox[0] + bbox[2]) / 2.0
+                            center_y = (bbox[1] + bbox[3]) / 2.0
                             
+                            # WGS84 위경도로 투영 변환
+                            lon, lat = transformer.transform(center_x, center_y)
+                            
+                            grid_records.append({
+                                '250M격자': str(grid_id),
+                                'lat': lat,
+                                'lon': lon
+                            })
+                        
+                        coords_df = pd.DataFrame(grid_records).drop_duplicates()
+                        coords_df.to_csv("grid_coords.csv", index=False, encoding='utf-8-sig')
+                        st.sidebar.success(f"✅ 총 {len(coords_df):,}개 격자의 좌표(`grid_coords.csv`) 추출 완료!")
+                        
             except Exception as e:
                 st.sidebar.error(f"❌ 파일 처리 중 오류 발생: {e}")
 
@@ -209,10 +234,12 @@ if submit_button:
                 
                 df_res['target_sum'] = df_res[selected_cols].sum(axis=1)
                 grid_summary = df_res.groupby('250M격자')['target_sum'].mean().reset_index()
+                grid_summary['250M격자'] = grid_summary['250M격자'].astype(str)
                 
-                # 좌표 데이터 매핑 (Shapefile 업로드로 자동 생성된 grid_coords.csv 활용)
+                # 좌표 데이터 매핑 (grid_coords.csv 활용)
                 if os.path.exists("grid_coords.csv"):
                     coords_df = pd.read_csv("grid_coords.csv")
+                    coords_df['250M격자'] = coords_df['250M격자'].astype(str)
                     map_df = pd.merge(grid_summary, coords_df, on="250M격자", how="inner")
                 else:
                     map_df = grid_summary.copy()
@@ -220,56 +247,59 @@ if submit_button:
                     map_df['lon'] = 126.9780
                     st.warning("⚠️ `grid_coords.csv` 파일이 없습니다. 사이드바의 '1-2. 격자 공간 데이터'에서 Shapefile (.zip)을 올려 좌표를 생성해 주세요.")
 
-                # 동적 색상 매핑
-                max_val = map_df['target_sum'].max() if not map_df.empty and map_df['target_sum'].max() > 0 else 1
-                map_df['norm'] = map_df['target_sum'] / max_val
-                
-                map_df['r'] = (255 * map_df['norm']).astype(int)
-                map_df['g'] = (255 * (1 - map_df['norm'] * 0.8)).astype(int)
-                map_df['b'] = 50
-                map_df['a'] = 200
-                map_df['color'] = map_df.apply(lambda row: [row['r'], row['g'], row['b'], row['a']], axis=1)
-
-                # 지도 뷰 설정
-                mid_lat = map_df['lat'].mean() if not map_df.empty else 37.5665
-                mid_lon = map_df['lon'].mean() if not map_df.empty else 126.9780
-                
-                view_state = pdk.ViewState(
-                    latitude=mid_lat,
-                    longitude=mid_lon,
-                    zoom=11,
-                    pitch=45 if map_type.startswith("3D") else 0
-                )
-                
-                if map_type.startswith("3D"):
-                    layer = pdk.Layer(
-                        "ColumnLayer",
-                        data=map_df,
-                        get_position=["lon", "lat"],
-                        get_elevation="target_sum",
-                        elevation_scale=0.3,
-                        radius=80,
-                        get_fill_color="color",
-                        pickable=True,
-                        auto_highlight=True
-                    )
+                if map_df.empty:
+                    st.error("⚠️ 인구 데이터와 좌표 데이터 간 일치하는 격자 ID가 없습니다.")
                 else:
-                    layer = pdk.Layer(
-                        "HeatmapLayer",
-                        data=map_df,
-                        get_position=["lon", "lat"],
-                        get_weight="target_sum",
-                        radius_pixels=25
+                    # 동적 색상 매핑
+                    max_val = map_df['target_sum'].max() if map_df['target_sum'].max() > 0 else 1
+                    map_df['norm'] = map_df['target_sum'] / max_val
+                    
+                    map_df['r'] = (255 * map_df['norm']).astype(int)
+                    map_df['g'] = (255 * (1 - map_df['norm'] * 0.8)).astype(int)
+                    map_df['b'] = 50
+                    map_df['a'] = 200
+                    map_df['color'] = map_df.apply(lambda row: [row['r'], row['g'], row['b'], row['a']], axis=1)
+
+                    # 지도 뷰 설정
+                    mid_lat = map_df['lat'].mean()
+                    mid_lon = map_df['lon'].mean()
+                    
+                    view_state = pdk.ViewState(
+                        latitude=mid_lat,
+                        longitude=mid_lon,
+                        zoom=11,
+                        pitch=45 if map_type.startswith("3D") else 0
                     )
-                
-                deck = pdk.Deck(
-                    layers=[layer],
-                    initial_view_state=view_state,
-                    tooltip={"html": "<b>격자 ID:</b> {250M격자}<br/><b>평균 타겟 인구:</b> {target_sum:.1f}명"}
-                )
-                
-                st.subheader("🗺️ 서울시 250m 격자 타겟 생활인구 지도")
-                st.pydeck_chart(deck)
-                
-                st.subheader("📊 타겟 유동인구 상위 20개 격자")
-                st.dataframe(grid_summary.sort_values(by='target_sum', ascending=False).head(20), use_container_width=True)
+                    
+                    if map_type.startswith("3D"):
+                        layer = pdk.Layer(
+                            "ColumnLayer",
+                            data=map_df,
+                            get_position=["lon", "lat"],
+                            get_elevation="target_sum",
+                            elevation_scale=0.3,
+                            radius=80,
+                            get_fill_color="color",
+                            pickable=True,
+                            auto_highlight=True
+                        )
+                    else:
+                        layer = pdk.Layer(
+                            "HeatmapLayer",
+                            data=map_df,
+                            get_position=["lon", "lat"],
+                            get_weight="target_sum",
+                            radius_pixels=25
+                        )
+                    
+                    deck = pdk.Deck(
+                        layers=[layer],
+                        initial_view_state=view_state,
+                        tooltip={"html": "<b>격자 ID:</b> {250M격자}<br/><b>평균 타겟 인구:</b> {target_sum:.1f}명"}
+                    )
+                    
+                    st.subheader("🗺️ 서울시 250m 격자 타겟 생활인구 지도")
+                    st.pydeck_chart(deck)
+                    
+                    st.subheader("📊 타겟 유동인구 상위 20개 격자")
+                    st.dataframe(grid_summary.sort_values(by='target_sum', ascending=False).head(20), use_container_width=True)
