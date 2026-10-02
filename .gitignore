@@ -1,0 +1,4 @@
+seoul_population.db
+grid_coords.csv
+__pycache__/
+.streamlit/secrets.toml
