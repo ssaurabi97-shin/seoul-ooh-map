@@ -4,6 +4,7 @@ import sqlite3
 import pydeck as pdk
 import re
 import os
+import glob
 import tempfile
 import zipfile
 import shapefile
@@ -35,6 +36,82 @@ def ensure_index():
         pass
     finally:
         conn.close()
+
+# ===================================================================
+# --- 폴더 내 개별 파일 자동 감지 및 DB/좌표 자동 생성 ---
+# ===================================================================
+def auto_build_coords_from_shp():
+    """폴더 내 .shp 파일이 존재할 경우 grid_coords.csv 자동 생성"""
+    if os.path.exists(COORDS_PATH):
+        return
+    shp_files = glob.glob("*.shp")
+    if not shp_files:
+        return
+
+    shp_path = shp_files[0]
+    prj_path = shp_path.replace(".shp", ".prj")
+
+    src_crs = "EPSG:5181"
+    if os.path.exists(prj_path):
+        try:
+            with open(prj_path, 'r', encoding='utf-8', errors='ignore') as pf:
+                prj_txt = pf.read()
+                if "5179" in prj_txt or "UTM-K" in prj_txt:
+                    src_crs = "EPSG:5179"
+                elif "5181" in prj_txt or "Central Belt" in prj_txt:
+                    src_crs = "EPSG:5181"
+                elif "5186" in prj_txt:
+                    src_crs = "EPSG:5186"
+        except Exception:
+            pass
+
+    transformer = Transformer.from_crs(src_crs, "EPSG:4326", always_xy=True)
+    sf = shapefile.Reader(shp_path)
+    fields = [f[0] for f in sf.fields[1:]]
+    grid_col_idx = next((i for i, c in enumerate(fields) if '격자' in c or 'GRID' in c.upper() or 'ID' in c.upper()), 0)
+
+    grid_records = []
+    for shape_rec in sf.shapeRecords():
+        grid_id = shape_rec.record[grid_col_idx]
+        bbox = shape_rec.shape.bbox
+        center_x = (bbox[0] + bbox[2]) / 2.0
+        center_y = (bbox[1] + bbox[3]) / 2.0
+        lon, lat = transformer.transform(center_x, center_y)
+        grid_records.append({
+            '250M격자': str(grid_id),
+            'lat': lat,
+            'lon': lon
+        })
+
+    coords_df = pd.DataFrame(grid_records).drop_duplicates()
+    coords_df.to_csv(COORDS_PATH, index=False, encoding='utf-8-sig')
+
+def auto_build_db_from_csvs():
+    """폴더 내 CSV 파일들이 존재할 경우 seoul_population.db 자동 생성"""
+    csv_files = glob.glob("250_LOCAL_RESD_*.csv") + glob.glob("*.csv")
+    csv_files = [f for f in csv_files if f != COORDS_PATH]
+
+    if not csv_files:
+        return
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='raw_population'")
+    table_exists = cursor.fetchone()
+
+    if not table_exists:
+        for csv_file in csv_files:
+            try:
+                df = pd.read_csv(csv_file, encoding='euc-kr')
+            except Exception:
+                df = pd.read_csv(csv_file, encoding='utf-8')
+            df.to_sql('raw_population', conn, if_exists='append', index=False)
+        ensure_index()
+    conn.close()
+
+# 앱 실행 시 자동 빌드 수행
+auto_build_coords_from_shp()
+auto_build_db_from_csvs()
 
 # ===================================================================
 # --- 데이터 및 좌표 상태 확인 함수 ---
@@ -238,10 +315,7 @@ with st.sidebar.form(key="filter_form"):
     st.subheader("🎨 브이월드 지도 시각화 옵션")
     map_type = st.radio("표현 방식", ["2D 도트 지도 (Scatter)", "3D 기둥 (Column)", "2D 번짐 열지도 (Heatmap)"])
     
-    # 도트 크기 조절 슬라이더
     dot_radius = st.slider("도트 크기 / 반지름 (픽셀)", min_value=1, max_value=20, value=3, help="축소 시 2~4px 설정 권장")
-    
-    # 브이월드 지도 테마 선택 (Base / Midnight)
     map_style_choice = st.selectbox("브이월드 배경 테마", ["브이월드 기본 지도 (Base)", "브이월드 심야 지도 (Midnight)"])
     
     submit_button = st.form_submit_button(label="🔍 데이터 분석 & 지도 생성", use_container_width=True)
@@ -289,7 +363,6 @@ if submit_button:
                 grid_summary = df_res.groupby('250M격자')['target_sum'].mean().reset_index()
                 grid_summary['250M격자'] = grid_summary['250M격자'].astype(str)
                 
-                # 좌표 데이터 매핑
                 if os.path.exists(COORDS_PATH):
                     coords_df = pd.read_csv(COORDS_PATH)
                     coords_df['250M격자'] = coords_df['250M격자'].astype(str)
@@ -298,12 +371,11 @@ if submit_button:
                     map_df = grid_summary.copy()
                     map_df['lat'] = 37.5665
                     map_df['lon'] = 126.9780
-                    st.warning("⚠️ 격자 좌표 파일이 없습니다. 사이드바의 '신규 데이터 추가' 메뉴에서 Shapefile(.zip)을 올려 좌표를 생성해 주세요.")
+                    st.warning("⚠️ 격자 좌표 파일이 없습니다.")
 
                 if map_df.empty:
                     st.error("⚠️ 인구 데이터와 좌표 데이터 간 일치하는 격자 ID가 없습니다.")
                 else:
-                    # 상대 분위수(Quantile) 기반 5단계 매핑
                     try:
                         map_df['grade'] = pd.qcut(map_df['target_sum'], q=5, labels=[1, 2, 3, 4, 5], duplicates='drop')
                     except Exception:
@@ -312,16 +384,15 @@ if submit_button:
                     map_df['grade'] = map_df['grade'].astype(int)
                     
                     color_map = {
-                        1: [144, 202, 249, 200], # 1단계 (하위 0~20%): 연한 하늘색
-                        2: [139, 195, 74, 200],  # 2단계 (20~40%): 밝은 연두색
-                        3: [255, 235, 59, 200],  # 3단계 (40~60%): 선명한 노란색
-                        4: [255, 152, 0, 200],   # 4단계 (60~80%): 진한 주황색
-                        5: [213, 0, 0, 220]      # 5단계 (상위 80~100%): 자줏빛 빨강 (핫스팟)
+                        1: [144, 202, 249, 200],
+                        2: [139, 195, 74, 200],
+                        3: [255, 235, 59, 200],
+                        4: [255, 152, 0, 200],
+                        5: [213, 0, 0, 220]
                     }
                     
                     map_df['color'] = [color_map[g] for g in map_df['grade']]
 
-                    # 지도 카메라 시작 위치
                     mid_lat = map_df['lat'].mean()
                     mid_lon = map_df['lon'].mean()
                     
@@ -332,9 +403,6 @@ if submit_button:
                         pitch=45 if "3D" in map_type else 0
                     )
                     
-                    # -------------------------------------------------------------
-                    # 1. 브이월드(VWorld) 배경 타일 레이어 정의
-                    # -------------------------------------------------------------
                     vworld_type = "Base" if "Base" in map_style_choice else "Midnight"
                     vworld_tile_url = f"https://api.vworld.kr/req/wmts/1.0.0/{VWORLD_API_KEY}/{vworld_type}/{{z}}/{{y}}/{{x}}.png"
                     
@@ -346,9 +414,6 @@ if submit_button:
                         tile_size=256,
                     )
                     
-                    # -------------------------------------------------------------
-                    # 2. 유동인구 데이터 표현 레이어 정의
-                    # -------------------------------------------------------------
                     if "Scatter" in map_type:
                         data_layer = pdk.Layer(
                             "ScatterplotLayer",
@@ -383,17 +448,15 @@ if submit_button:
                             threshold=0.05
                         )
                     
-                    # 브이월드 배경 레이어 + 데이터 레이어 합성
                     deck = pdk.Deck(
                         layers=[vworld_background_layer, data_layer],
                         initial_view_state=view_state,
-                        map_style=None,  # Mapbox 기본 스타일을 비활성화하고 브이월드 타일 사용
+                        map_style=None,
                         tooltip={"html": "<b>격자 ID:</b> {250M격자}<br/><b>평균 타겟 인구:</b> {target_sum:.1f}명 (<b>{grade}단계</b>)"}
                     )
                     
                     st.subheader("🗺️ 서울시 250m 격자 타겟 생활인구 지도 (브이월드 타일 적용)")
                     
-                    # 5단계 범례(Legend) 표시
                     st.markdown("""
                     <div style="display: flex; gap: 10px; margin-bottom: 12px; font-weight: bold; font-size: 13px;">
                         <span style="background-color: #90CAF9; color: #000; padding: 4px 8px; border-radius: 4px;">🔵 1단계 (0~20%)</span>
