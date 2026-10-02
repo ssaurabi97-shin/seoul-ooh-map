@@ -5,7 +5,6 @@ import urllib.request
 
 import duckdb
 import pandas as pd
-import pydeck as pdk
 import streamlit as st
 
 # ==========================================
@@ -234,39 +233,132 @@ legend = "".join(
 st.markdown(f'<div style="margin:8px 0 12px 0;">{legend}</div>', unsafe_allow_html=True)
 
 # ==========================================
-# 4. 지도
+# 4. 지도 (deck.gl + 브이월드 래스터 타일)
 # ==========================================
-layers = []
+# st.pydeck_chart 는 래스터 타일(TileLayer)을 그리는 사용자 정의 렌더러를 지원하지 않아
+# 브이월드 배경이 흰 화면으로 나옵니다. 그래서 deck.gl을 iframe에 직접 로드합니다.
+MAP_HTML = """<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<style>
+  html,body{margin:0;height:100%;background:#dfe3e8;font-family:sans-serif}
+  #map{position:absolute;inset:0}
+  #msg{position:absolute;left:8px;bottom:8px;max-width:90%;padding:6px 10px;border-radius:4px;
+       background:rgba(180,30,30,.92);color:#fff;font-size:12px;display:none;z-index:5}
+  #info{position:absolute;right:8px;bottom:8px;padding:2px 6px;border-radius:3px;
+        background:rgba(255,255,255,.75);color:#333;font-size:11px;z-index:4}
+</style>
+<script src="https://cdn.jsdelivr.net/npm/deck.gl@8.9.36/dist.min.js"
+        onerror="loadFallback()"></script>
+</head><body>
+<div id="map"></div><div id="msg"></div><div id="info">__INFO__</div>
+<script>
+const DATA = __DATA__;
+const CFG = __CFG__;
+let started = false;
+function show(t){const m=document.getElementById('msg');m.style.display='block';m.textContent=t;}
+window.onerror = function(m){show('지도 오류: '+m);};
+function loadFallback(){
+  const s=document.createElement('script');
+  s.src='https://unpkg.com/deck.gl@8.9.36/dist.min.js';
+  s.onload=start;
+  s.onerror=function(){show('deck.gl 라이브러리를 불러오지 못했습니다. (사내망/보안 설정으로 CDN이 막혔을 수 있습니다)');};
+  document.head.appendChild(s);
+}
+function start(){
+  if(started) return; started = true;
+  const layers = [];
+  let tileErrors = 0;
+  if(CFG.tileUrl){
+    layers.push(new deck.TileLayer({
+      id:'vworld', data:CFG.tileUrl, minZoom:6, maxZoom:19, tileSize:256,
+      onTileError:function(){
+        tileErrors++;
+        if(tileErrors===3) show('브이월드 타일을 불러오지 못했습니다. API 키와 허용 도메인(streamlit.app 주소) 등록을 확인하세요.');
+      },
+      renderSubLayers:function(props){
+        const t=props.tile;
+        let b;
+        if(t.bbox && t.bbox.west!==undefined){ b=[t.bbox.west,t.bbox.south,t.bbox.east,t.bbox.north]; }
+        else { const bb=t.boundingBox; b=[bb[0][0],bb[0][1],bb[1][0],bb[1][1]]; }
+        return new deck.BitmapLayer(props,{data:null,image:props.data,bounds:b});
+      }
+    }));
+  }
+  if(CFG.viz==='scatter'){
+    layers.push(new deck.ScatterplotLayer({
+      id:'pts', data:DATA, pickable:true,
+      getPosition:d=>[d.x,d.y], getFillColor:d=>d.c,
+      getRadius:CFG.dot, radiusUnits:'pixels', radiusMinPixels:1
+    }));
+  } else if(CFG.viz==='column'){
+    layers.push(new deck.ColumnLayer({
+      id:'cols', data:DATA, pickable:true, extruded:true, diskResolution:12,
+      radius:110, getPosition:d=>[d.x,d.y], getElevation:d=>d.e, getFillColor:d=>d.c
+    }));
+  } else {
+    layers.push(new deck.HeatmapLayer({
+      id:'heat', data:DATA, getPosition:d=>[d.x,d.y], getWeight:d=>d.w,
+      radiusPixels:CFG.heat
+    }));
+  }
+  new deck.Deck({
+    parent:document.getElementById('map'),
+    initialViewState:{longitude:126.978,latitude:37.5665,zoom:10.5,pitch:CFG.pitch,bearing:0},
+    controller:true,
+    layers:layers,
+    getTooltip:function(o){
+      const d=o.object;
+      if(!d || d.i===undefined) return null;
+      return {html:'격자ID: '+d.i+'<br>타겟 인구: '+Number(d.p).toLocaleString()+'명',
+              style:{backgroundColor:'rgba(30,30,30,.9)',color:'#fff',fontSize:'12px'}};
+    }
+  });
+}
+window.addEventListener('load', function(){ if(typeof deck!=='undefined') start(); });
+</script></body></html>"""
+
+
+def build_map_html(df, viz, tile_url, dot, pitch, info):
+    cols = ["grid_id", "lon", "lat", "pop_label", "target_pop", "color"]
+    if viz == "column":
+        cols.append("elevation")
+    records = []
+    for r in df[cols].itertuples(index=False):
+        rec = {"i": r[0], "x": round(float(r[1]), 6), "y": round(float(r[2]), 6),
+               "p": int(r[3]), "w": round(float(r[4]), 2), "c": [int(v) for v in r[5]]}
+        if viz == "column":
+            rec["e"] = round(float(r[6]), 1)
+        records.append(rec)
+    cfg = {"viz": viz, "tileUrl": tile_url, "dot": dot, "heat": dot * 10, "pitch": pitch}
+    safe = lambda o: json.dumps(o, ensure_ascii=False, separators=(",", ":")).replace("</", "<\\/")
+    return (MAP_HTML.replace("__DATA__", safe(records))
+            .replace("__CFG__", safe(cfg))
+            .replace("__INFO__", info))
+
+
+tile_url = None
 if api_key:
     ext = "jpeg" if theme == "Satellite" else "png"
     tile_url = f"https://api.vworld.kr/req/wmts/1.0.0/{api_key}/{theme}/{{z}}/{{y}}/{{x}}.{ext}"
-    layers.append(pdk.Layer("TileLayer", data=tile_url, min_zoom=6, max_zoom=19, tile_size=256))
 else:
     st.info("브이월드 API 키가 없어 배경지도 없이 표시합니다.")
 
 if "Scatter" in viz_type:
-    layers.append(pdk.Layer("ScatterplotLayer", merged, get_position=["lon", "lat"],
-                            get_fill_color="color", get_radius=dot_size, radius_units="pixels",
-                            radius_min_pixels=1, pickable=True))
+    viz_key = "scatter"
 elif "Column" in viz_type:
+    viz_key = "column"
     max_pop = merged["target_pop"].max() or 1
     merged["elevation"] = merged["target_pop"] / max_pop * 3000
-    layers.append(pdk.Layer("ColumnLayer", merged, get_position=["lon", "lat"],
-                            get_elevation="elevation", get_fill_color="color",
-                            radius=110, extruded=True, pickable=True))
 else:
-    layers.append(pdk.Layer("HeatmapLayer", merged, get_position=["lon", "lat"],
-                            get_weight="target_pop", radius_pixels=dot_size * 10))
+    viz_key = "heatmap"
 
-deck = pdk.Deck(
-    layers=layers,
-    initial_view_state=pdk.ViewState(longitude=126.9780, latitude=37.5665, zoom=10.5,
-                                     pitch=45 if "Column" in viz_type else 0, bearing=0),
-    map_provider=None,
-    map_style=None,
-    tooltip={"text": "격자ID: {grid_id}\n타겟 인구: {pop_label}명"},
-)
-st.pydeck_chart(deck)
+map_html = build_map_html(merged, viz_key, tile_url, dot_size,
+                          45 if viz_key == "column" else 0, "© VWorld" if tile_url else "")
+if hasattr(st, "iframe"):
+    st.iframe(map_html, height=650)
+else:
+    import streamlit.components.v1 as components
+    components.html(map_html, height=650)
 
 # ==========================================
 # 5. 상위 20개 격자
