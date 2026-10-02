@@ -1,0 +1,44 @@
+name: Build parquet data
+
+# 저장소 루트의 일별 CSV(250_LOCAL_RESD_YYYYMMDD.csv)를 Parquet으로 변환해
+# data/daily/*.parquet, data/manifest.json, grid_coords.csv 를 자동 커밋합니다.
+# 새 CSV를 올리면 자동 실행되고, Actions 탭에서 수동 실행(Run workflow)도 가능합니다.
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "250_LOCAL_RESD_*.csv"
+      - "build_data.py"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install build dependencies
+        run: pip install -r requirements-build.txt
+
+      - name: Convert CSV to Parquet
+        run: python build_data.py --csv-dir . --out-dir data --shp match.shp
+
+      - name: Commit results
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -f data grid_coords.csv
+          if git diff --cached --quiet; then
+            echo "변경 사항 없음"
+          else
+            git commit -m "Build parquet data (auto)"
+            git pull --rebase origin main
+            git push
+          fi
