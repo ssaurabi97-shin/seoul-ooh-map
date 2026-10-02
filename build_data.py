@@ -20,7 +20,7 @@ import re
 import geopandas as gpd
 import pandas as pd
 
-ID_CANDS = ["격자ID", "격자id", "GRID_ID", "격자코드", "집계구코드", "TOT_REG_CD",
+ID_CANDS = ["250M격자", "250m격자", "격자ID", "격자id", "GRID_ID", "격자코드", "집계구코드", "TOT_REG_CD",
             "ADSTRD_CODE_SE", "GID", "ID"]
 TIME_CANDS = ["시간대", "시간대구분", "TMZON", "TMZON_PD_SE", "HOUR", "시간"]
 GENDER_CANDS = ["성별", "GENDER", "SEX"]
@@ -41,7 +41,10 @@ def read_csv_auto(path):
     last = None
     for enc in ("utf-8-sig", "cp949", "euc-kr"):
         try:
-            return pd.read_csv(path, encoding=enc, low_memory=False)
+            head = pd.read_csv(path, encoding=enc, nrows=0)
+            id_col = find_col(list(head.columns), ID_CANDS)
+            dtype = {id_col: str} if id_col else None  # 격자ID 앞자리 0 보존
+            return pd.read_csv(path, encoding=enc, low_memory=False, dtype=dtype, thousands=",")
         except UnicodeDecodeError as e:
             last = e
     raise last
