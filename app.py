@@ -12,10 +12,14 @@ from pyproj import Transformer
 st.set_page_config(page_title="서울시 OOH 타겟 생활인구 지도", layout="wide")
 
 st.title("🗺️ 서울시 250m 격자 타겟 생활인구 3D 지도 분석")
-st.write("2024년 이후 일별 CSV 데이터를 DB에 누적 저장하고, 타겟 조건별 유동인구 밀집도를 정밀 시각화합니다.")
+st.write("2024년 이후 일별 CSV 데이터를 DB에 누적 저장하고, 브이월드(VWorld) 배경 지도에 타겟 유동인구 밀집도를 정밀 시각화합니다.")
 
+# ===================================================================
+# --- 기본 설정 및 VWorld API 인증키 ---
+# ===================================================================
 DB_PATH = "seoul_population.db"
 COORDS_PATH = "grid_coords.csv"
+VWORLD_API_KEY = "7B6105E1-F578-4901-B9FF-555769B5D382"
 
 def get_db_connection():
     return sqlite3.connect(DB_PATH)
@@ -231,14 +235,14 @@ with st.sidebar.form(key="filter_form"):
     selected_ages = st.multiselect("연령대 선택", options=extracted_ages, default=default_ages if default_ages else extracted_ages[:4])
     
     st.markdown("---")
-    st.subheader("🎨 지도 시각화 옵션")
+    st.subheader("🎨 브이월드 지도 시각화 옵션")
     map_type = st.radio("표현 방식", ["2D 도트 지도 (Scatter)", "3D 기둥 (Column)", "2D 번짐 열지도 (Heatmap)"])
     
     # 도트 크기 조절 슬라이더
     dot_radius = st.slider("도트 크기 / 반지름 (픽셀)", min_value=1, max_value=20, value=3, help="축소 시 2~4px 설정 권장")
     
-    # 지도 배경 스타일 선택
-    map_style_choice = st.selectbox("지도 배경 스타일", ["밝은 지도 (Light)", "어두운 지도 (Dark)"])
+    # 브이월드 지도 테마 선택 (Base / Midnight)
+    map_style_choice = st.selectbox("브이월드 배경 테마", ["브이월드 기본 지도 (Base)", "브이월드 심야 지도 (Midnight)"])
     
     submit_button = st.form_submit_button(label="🔍 데이터 분석 & 지도 생성", use_container_width=True)
 
@@ -263,7 +267,7 @@ if submit_button:
         if not selected_cols:
             st.warning("⚠️ 선택한 조건에 해당하는 데이터 컬럼이 없습니다.")
         else:
-            with st.spinner("데이터 조회 및 시각화 준비 중..."):
+            with st.spinner("데이터 조회 및 브이월드 지도 생성 중..."):
                 conn = get_db_connection()
                 date_str = "', '".join([str(d) for d in selected_dates])
                 cols_sql = ", ".join([f"`{c}`" for c in selected_cols])
@@ -299,18 +303,14 @@ if submit_button:
                 if map_df.empty:
                     st.error("⚠️ 인구 데이터와 좌표 데이터 간 일치하는 격자 ID가 없습니다.")
                 else:
-                    # ===================================================================
-                    # --- 상대 분위수(Quantile) 기반 5단계 매핑 (Categorical 에러 방지 처리) ---
-                    # ===================================================================
+                    # 상대 분위수(Quantile) 기반 5단계 매핑
                     try:
                         map_df['grade'] = pd.qcut(map_df['target_sum'], q=5, labels=[1, 2, 3, 4, 5], duplicates='drop')
                     except Exception:
                         map_df['grade'] = pd.qcut(map_df['target_sum'].rank(method='first'), q=5, labels=[1, 2, 3, 4, 5])
                     
-                    # 1. Categorical 타입을 명시적 정수형(int)으로 변환
                     map_df['grade'] = map_df['grade'].astype(int)
                     
-                    # 2. 5단계 RGB 색상 정의
                     color_map = {
                         1: [144, 202, 249, 200], # 1단계 (하위 0~20%): 연한 하늘색
                         2: [139, 195, 74, 200],  # 2단계 (20~40%): 밝은 연두색
@@ -319,13 +319,11 @@ if submit_button:
                         5: [213, 0, 0, 220]      # 5단계 (상위 80~100%): 자줏빛 빨강 (핫스팟)
                     }
                     
-                    # 3. 리스트 컴프리헨션으로 안전하게 색상 매핑
                     map_df['color'] = [color_map[g] for g in map_df['grade']]
 
-                    # 지도 뷰 및 테마 설정
+                    # 지도 카메라 시작 위치
                     mid_lat = map_df['lat'].mean()
                     mid_lon = map_df['lon'].mean()
-                    map_style = "light" if "Light" in map_style_choice else "dark"
                     
                     view_state = pdk.ViewState(
                         latitude=mid_lat,
@@ -334,9 +332,25 @@ if submit_button:
                         pitch=45 if "3D" in map_type else 0
                     )
                     
-                    # PyDeck 레이어 구성
+                    # -------------------------------------------------------------
+                    # 1. 브이월드(VWorld) 배경 타일 레이어 정의
+                    # -------------------------------------------------------------
+                    vworld_type = "Base" if "Base" in map_style_choice else "Midnight"
+                    vworld_tile_url = f"https://api.vworld.kr/req/wmts/1.0.0/{VWORLD_API_KEY}/{vworld_type}/{{z}}/{{y}}/{{x}}.png"
+                    
+                    vworld_background_layer = pdk.Layer(
+                        "TileLayer",
+                        data=vworld_tile_url,
+                        min_zoom=0,
+                        max_zoom=19,
+                        tile_size=256,
+                    )
+                    
+                    # -------------------------------------------------------------
+                    # 2. 유동인구 데이터 표현 레이어 정의
+                    # -------------------------------------------------------------
                     if "Scatter" in map_type:
-                        layer = pdk.Layer(
+                        data_layer = pdk.Layer(
                             "ScatterplotLayer",
                             data=map_df,
                             get_position=["lon", "lat"],
@@ -347,7 +361,7 @@ if submit_button:
                             opacity=0.85
                         )
                     elif "3D" in map_type:
-                        layer = pdk.Layer(
+                        data_layer = pdk.Layer(
                             "ColumnLayer",
                             data=map_df,
                             get_position=["lon", "lat"],
@@ -359,7 +373,7 @@ if submit_button:
                             auto_highlight=True
                         )
                     else:
-                        layer = pdk.Layer(
+                        data_layer = pdk.Layer(
                             "HeatmapLayer",
                             data=map_df,
                             get_position=["lon", "lat"],
@@ -369,16 +383,17 @@ if submit_button:
                             threshold=0.05
                         )
                     
+                    # 브이월드 배경 레이어 + 데이터 레이어 합성
                     deck = pdk.Deck(
-                        layers=[layer],
+                        layers=[vworld_background_layer, data_layer],
                         initial_view_state=view_state,
-                        map_style=map_style,
+                        map_style=None,  # Mapbox 기본 스타일을 비활성화하고 브이월드 타일 사용
                         tooltip={"html": "<b>격자 ID:</b> {250M격자}<br/><b>평균 타겟 인구:</b> {target_sum:.1f}명 (<b>{grade}단계</b>)"}
                     )
                     
-                    st.subheader("🗺️ 서울시 250m 격자 타겟 생활인구 지도")
+                    st.subheader("🗺️ 서울시 250m 격자 타겟 생활인구 지도 (브이월드 타일 적용)")
                     
-                    # --- 5단계 범례(Legend) 표시 ---
+                    # 5단계 범례(Legend) 표시
                     st.markdown("""
                     <div style="display: flex; gap: 10px; margin-bottom: 12px; font-weight: bold; font-size: 13px;">
                         <span style="background-color: #90CAF9; color: #000; padding: 4px 8px; border-radius: 4px;">🔵 1단계 (0~20%)</span>
