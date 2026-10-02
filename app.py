@@ -1,473 +1,313 @@
-import streamlit as st
-import pandas as pd
-import sqlite3
-import pydeck as pdk
-import re
 import os
 import glob
-import tempfile
-import zipfile
-import shapefile
-from pyproj import Transformer
+import sqlite3
+import pandas as pd
+import geopandas as gpd
+import streamlit as st
+import pydeck as pdk
 
-st.set_page_config(page_title="서울시 OOH 타겟 생활인구 지도", layout="wide")
+# ==========================================
+# 0. 페이지 기본 설정 및 상수
+# ==========================================
+st.set_page_config(
+    page_title="서울시 250m 격자 타겟 생활인구 3D 지도 분석",
+    page_icon="🗺️",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-st.title("🗺️ 서울시 250m 격자 타겟 생활인구 3D 지도 분석")
-st.write("2024년 이후 일별 CSV 데이터를 DB에 누적 저장하고, 브이월드(VWorld) 배경 지도에 타겟 유동인구 밀집도를 정밀 시각화합니다.")
-
-# ===================================================================
-# --- 기본 설정 및 VWorld API 인증키 ---
-# ===================================================================
-DB_PATH = "seoul_population.db"
-COORDS_PATH = "grid_coords.csv"
 VWORLD_API_KEY = "7B6105E1-F578-4901-B9FF-555769B5D382"
+DB_PATH = "seoul_population.db"
+GRID_PATH = "grid_coords.csv"
 
-def get_db_connection():
-    return sqlite3.connect(DB_PATH)
-
-def ensure_index():
-    """DB에 인덱스를 생성하여 날짜/시간 조회 속도 최적화"""
-    conn = get_db_connection()
+# ==========================================
+# 1. DB 및 격자 좌표 데이터 자동 구축/로드
+# ==========================================
+@st.cache_resource
+def init_data_store():
+    """CSV 데이터 및 Shapefile을 읽어 SQLite DB와 격자 좌표 CSV를 자동 생성"""
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    try:
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_date_time ON raw_population (일자, 시간)")
-        conn.commit()
-    except Exception:
-        pass
-    finally:
-        conn.close()
+    
+    # 인구 DB 테이블 생성
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS population (
+            stdr_de TEXT,
+            tmzon INTEGER,
+            grid_id TEXT,
+            gender TEXT,
+            age_grp TEXT,
+            pop_cnt REAL
+        )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_pop ON population(stdr_de, tmzon, gender, age_grp)")
+    conn.commit()
 
-# ===================================================================
-# --- 폴더 내 개별 파일 자동 감지 및 DB/좌표 자동 생성 ---
-# ===================================================================
-def auto_build_coords_from_shp():
-    """폴더 내 .shp 파일이 존재할 경우 grid_coords.csv 자동 생성"""
-    if os.path.exists(COORDS_PATH):
-        return
-    shp_files = glob.glob("*.shp")
-    if not shp_files:
-        return
-
-    shp_path = shp_files[0]
-    prj_path = shp_path.replace(".shp", ".prj")
-
-    src_crs = "EPSG:5181"
-    if os.path.exists(prj_path):
+    # 1-1. CSV 데이터 자동 임포트
+    csv_files = glob.glob("*.csv")
+    data_csvs = [f for f in csv_files if f != GRID_PATH]
+    
+    cursor.execute("SELECT DISTINCT stdr_de FROM population")
+    existing_dates = set(row[0] for row in cursor.fetchall())
+    
+    for csv_file in data_csvs:
         try:
-            with open(prj_path, 'r', encoding='utf-8', errors='ignore') as pf:
-                prj_txt = pf.read()
-                if "5179" in prj_txt or "UTM-K" in prj_txt:
-                    src_crs = "EPSG:5179"
-                elif "5181" in prj_txt or "Central Belt" in prj_txt:
-                    src_crs = "EPSG:5181"
-                elif "5186" in prj_txt:
-                    src_crs = "EPSG:5186"
-        except Exception:
+            df_temp = pd.read_csv(csv_file, nrows=5)
+            if '기준일자' in df_temp.columns or 'STDR_DE' in df_temp.columns:
+                df = pd.read_csv(csv_file)
+                # 컬럼명 통일
+                date_col = '기준일자' if '기준일자' in df.columns else 'STDR_DE'
+                time_col = '시간대' if '시간대' in df.columns else 'TMZON'
+                grid_col = '격자ID' if '격자ID' in df.columns else 'GRID_ID'
+                gender_col = '성별' if '성별' in df.columns else 'GENDER'
+                age_col = '연령대' if '연령대' in df.columns else 'AGE_GRP'
+                pop_col = '인구수' if '인구수' in df.columns else 'POP_CNT'
+                
+                df_clean = df[[date_col, time_col, grid_col, gender_col, age_col, pop_col]].copy()
+                df_clean.columns = ['stdr_de', 'tmzon', 'grid_id', 'gender', 'age_grp', 'pop_cnt']
+                df_clean['stdr_de'] = df_clean['stdr_de'].astype(str)
+                
+                file_dates = set(df_clean['stdr_de'].unique())
+                if not file_dates.issubset(existing_dates):
+                    df_clean.to_sql('population', conn, if_exists='append', index=False)
+                    existing_dates.update(file_dates)
+        except Exception as e:
             pass
 
-    transformer = Transformer.from_crs(src_crs, "EPSG:4326", always_xy=True)
-    sf = shapefile.Reader(shp_path)
-    fields = [f[0] for f in sf.fields[1:]]
-    grid_col_idx = next((i for i, c in enumerate(fields) if '격자' in c or 'GRID' in c.upper() or 'ID' in c.upper()), 0)
-
-    grid_records = []
-    for shape_rec in sf.shapeRecords():
-        grid_id = shape_rec.record[grid_col_idx]
-        bbox = shape_rec.shape.bbox
-        center_x = (bbox[0] + bbox[2]) / 2.0
-        center_y = (bbox[1] + bbox[3]) / 2.0
-        lon, lat = transformer.transform(center_x, center_y)
-        grid_records.append({
-            '250M격자': str(grid_id),
-            'lat': lat,
-            'lon': lon
-        })
-
-    coords_df = pd.DataFrame(grid_records).drop_duplicates()
-    coords_df.to_csv(COORDS_PATH, index=False, encoding='utf-8-sig')
-
-def auto_build_db_from_csvs():
-    """폴더 내 CSV 파일들이 존재할 경우 seoul_population.db 자동 생성"""
-    csv_files = glob.glob("250_LOCAL_RESD_*.csv") + glob.glob("*.csv")
-    csv_files = [f for f in csv_files if f != COORDS_PATH]
-
-    if not csv_files:
-        return
-
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='raw_population'")
-    table_exists = cursor.fetchone()
-
-    if not table_exists:
-        for csv_file in csv_files:
+    # 1-2. Shapefile 기반 격자 중심점 좌표(WGS84) 자동 생성
+    if not os.path.exists(GRID_PATH):
+        shp_files = glob.glob("*.shp")
+        if shp_files:
             try:
-                df = pd.read_csv(csv_file, encoding='euc-kr')
-            except Exception:
-                df = pd.read_csv(csv_file, encoding='utf-8')
-            df.to_sql('raw_population', conn, if_exists='append', index=False)
-        ensure_index()
+                gdf = gpd.read_file(shp_files[0])
+                gdf_wgs84 = gdf.to_crs(epsg=4326)
+                gdf_wgs84['lon'] = gdf_wgs84.geometry.centroid.x
+                gdf_wgs84['lat'] = gdf_wgs84.geometry.centroid.y
+                
+                id_col = [c for c in gdf_wgs84.columns if 'id' in c.lower() or 'grid' in c.lower() or 'code' in c.lower()][0]
+                gdf_wgs84[[id_col, 'lon', 'lat']].rename(columns={id_col: 'grid_id'}).to_csv(GRID_PATH, index=False)
+            except Exception as e:
+                pass
+                
     conn.close()
 
-# 앱 실행 시 자동 빌드 수행
-auto_build_coords_from_shp()
-auto_build_db_from_csvs()
+init_data_store()
 
-# ===================================================================
-# --- 데이터 및 좌표 상태 확인 함수 ---
-# ===================================================================
+# ==========================================
+# 2. 데이터 현황 조회 함수
+# ==========================================
 def get_db_status():
-    if not os.path.exists(DB_PATH):
-        return False, 0, []
-    try:
-        conn = get_db_connection()
-        count_df = pd.read_sql("SELECT COUNT(*) as cnt FROM raw_population", conn)
-        dates_df = pd.read_sql("SELECT DISTINCT 일자 FROM raw_population ORDER BY 일자", conn)
-        conn.close()
-        total_cnt = count_df['cnt'].iloc[0]
-        date_list = dates_df['일자'].astype(str).tolist()
-        return True, total_cnt, date_list
-    except Exception:
-        return False, 0, []
-
-def get_coords_status():
-    if os.path.exists(COORDS_PATH):
-        try:
-            df = pd.read_csv(COORDS_PATH)
-            return True, len(df)
-        except Exception:
-            return False, 0
-    return False, 0
-
-# ===================================================================
-# --- 사이드바: 1. 데이터 현황 및 누적 관리 ---
-# ===================================================================
-st.sidebar.header("📂 1. 저장된 데이터 현황")
-
-has_db, db_row_count, available_dates = get_db_status()
-has_coords, coords_count = get_coords_status()
-
-if has_db and db_row_count > 0:
-    st.sidebar.success(f"💾 **인구 DB:** 총 {db_row_count:,}행 ({len(available_dates)}개 일자 누적됨)")
-else:
-    st.sidebar.warning("💾 **인구 DB:** 데이터 없음 (CSV 업로드 필요)")
-
-if has_coords and coords_count > 0:
-    st.sidebar.success(f"📐 **격자 좌표:** {coords_count:,}개 격자 좌표 준비 완료")
-else:
-    st.sidebar.warning("📐 **격자 좌표:** 데이터 없음 (Shapefile 업로드 필요)")
-
-# 접이식 신규 파일 업로드 섹션
-with st.sidebar.expander("➕ 신규 데이터 추가 / 좌표 업데이트"):
-    st.markdown("#### 📄 일별 생활인구 CSV 추가")
-    uploaded_files = st.file_uploader(
-        "추가할 CSV 파일들을 올려주세요", 
-        type=["csv"], 
-        accept_multiple_files=True,
-        key="csv_uploader"
-    )
-
-    if uploaded_files:
-        if st.button("💾 DB에 추가 누적 저장하기", use_container_width=True):
-            conn = get_db_connection()
-            total_rows = 0
-            
-            with st.spinner("데이터베이스에 추가 저장 중입니다..."):
-                for uploaded_file in uploaded_files:
-                    try:
-                        df = pd.read_csv(uploaded_file, encoding='euc-kr')
-                    except Exception:
-                        df = pd.read_csv(uploaded_file, encoding='utf-8')
-                    
-                    df.to_sql('raw_population', conn, if_exists='append', index=False)
-                    total_rows += len(df)
-                    
-            conn.close()
-            ensure_index()
-            st.success(f"총 {len(uploaded_files)}개 파일 ({total_rows:,}행) DB 추가 저장 완료!")
-            st.rerun()
-
-    st.markdown("---")
-    st.markdown("#### 📐 격자 Shapefile (.zip) 업로드")
-    shapefile_zip = st.file_uploader(
-        "서울시 격자 Shapefile 패키지 (.zip)", 
-        type=["zip"],
-        key="zip_uploader"
-    )
-
-    if shapefile_zip:
-        if st.button("⚙️ 위경도 좌표 재생성하기", use_container_width=True):
-            with st.spinner("Shapefile 파싱 및 위경도 좌표 변환 중..."):
-                try:
-                    with tempfile.TemporaryDirectory() as tmp_dir:
-                        zip_path = os.path.join(tmp_dir, "grid_upload.zip")
-                        with open(zip_path, "wb") as f:
-                            f.write(shapefile_zip.getbuffer())
-                        
-                        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-                            zip_ref.extractall(tmp_dir)
-                        
-                        shp_path = None
-                        prj_path = None
-                        for root, dirs, files in os.walk(tmp_dir):
-                            for file in files:
-                                if file.endswith('.shp'):
-                                    shp_path = os.path.join(root, file)
-                                elif file.endswith('.prj'):
-                                    prj_path = os.path.join(root, file)
-                        
-                        if not shp_path:
-                            st.error("⚠️ .zip 파일 내에서 .shp 파일을 찾을 수 없습니다.")
-                        else:
-                            src_crs = "EPSG:5181"
-                            if prj_path:
-                                try:
-                                    with open(prj_path, 'r', encoding='utf-8', errors='ignore') as pf:
-                                        prj_txt = pf.read()
-                                        if "5179" in prj_txt or "UTM-K" in prj_txt:
-                                            src_crs = "EPSG:5179"
-                                        elif "5181" in prj_txt or "Central Belt" in prj_txt:
-                                            src_crs = "EPSG:5181"
-                                        elif "5186" in prj_txt:
-                                            src_crs = "EPSG:5186"
-                                except Exception:
-                                    pass
-                            
-                            transformer = Transformer.from_crs(src_crs, "EPSG:4326", always_xy=True)
-                            
-                            sf = shapefile.Reader(shp_path)
-                            fields = [f[0] for f in sf.fields[1:]]
-                            grid_col_idx = next((i for i, c in enumerate(fields) if '격자' in c or 'GRID' in c.upper() or 'ID' in c.upper()), 0)
-                            
-                            grid_records = []
-                            for shape_rec in sf.shapeRecords():
-                                grid_id = shape_rec.record[grid_col_idx]
-                                bbox = shape_rec.shape.bbox
-                                center_x = (bbox[0] + bbox[2]) / 2.0
-                                center_y = (bbox[1] + bbox[3]) / 2.0
-                                lon, lat = transformer.transform(center_x, center_y)
-                                grid_records.append({
-                                    '250M격자': str(grid_id),
-                                    'lat': lat,
-                                    'lon': lon
-                                })
-                            
-                            coords_df = pd.DataFrame(grid_records).drop_duplicates()
-                            coords_df.to_csv(COORDS_PATH, index=False, encoding='utf-8-sig')
-                            st.success(f"✅ 총 {len(coords_df):,}개 격자의 좌표 추출 완료!")
-                            st.rerun()
-                            
-                except Exception as e:
-                    st.error(f"❌ 파일 처리 중 오류 발생: {e}")
-
-# 데이터 초기화 옵션
-with st.sidebar.expander("🛠️ 데이터 초기화 / 관리"):
-    st.caption("저장된 DB 및 좌표 파일을 초기화하고 처음 상태로 되돌립니다.")
-    if st.button("🗑️ 전체 저장 데이터 삭제", use_container_width=True):
-        if os.path.exists(DB_PATH):
-            os.remove(DB_PATH)
-        if os.path.exists(COORDS_PATH):
-            os.remove(COORDS_PATH)
-        st.success("저장된 데이터가 삭제되었습니다.")
-        st.rerun()
-
-# ===================================================================
-# --- DB 데이터 메타데이터 읽기 ---
-# ===================================================================
-all_cols = []
-
-if has_db:
-    try:
-        conn = get_db_connection()
-        sample_df = pd.read_sql("SELECT * FROM raw_population LIMIT 1", conn)
-        all_cols = sample_df.columns.tolist()
-        conn.close()
-    except Exception:
-        pass
-
-# 성별/연령대 컬럼 파싱
-extracted_ages = []
-for col in all_cols:
-    if any(keyword in col for keyword in ['남자', '여자', '남성', '여성']):
-        cleaned = re.sub(r'남자|여자|남성|여성', '', col).strip()
-        if cleaned and cleaned not in extracted_ages:
-            extracted_ages.append(cleaned)
-
-default_ages = [a for a in extracted_ages if any(age in a for age in ['20~24', '25~29', '30~34', '35~39'])]
-
-# ===================================================================
-# --- 사이드바: 2. 분석 조건 설정 폼 ---
-# ===================================================================
-with st.sidebar.form(key="filter_form"):
-    st.header("🎯 2. 분석 조건 설정")
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
     
-    if available_dates:
-        selected_dates = st.multiselect("분석 일자 선택", options=available_dates, default=available_dates[-1:])
-    else:
-        selected_dates = []
-        st.info("먼저 데이터를 업로드해 주세요.")
+    cursor.execute("SELECT COUNT(*) FROM population")
+    total_rows = cursor.fetchone()[0]
+    
+    cursor.execute("SELECT DISTINCT stdr_de FROM population ORDER BY stdr_de")
+    dates = [row[0] for row in cursor.fetchall()]
+    conn.close()
+    
+    grid_count = 0
+    if os.path.exists(GRID_PATH):
+        grid_df = pd.read_csv(GRID_PATH)
+        grid_count = len(grid_df)
         
-    start_hour, end_hour = st.slider("시간대 범위 (시)", 0, 23, (8, 23))
-    selected_genders = st.multiselect("성별 선택", ["남성", "여성"], default=["여성"])
-    selected_ages = st.multiselect("연령대 선택", options=extracted_ages, default=default_ages if default_ages else extracted_ages[:4])
-    
-    st.markdown("---")
-    st.subheader("🎨 브이월드 지도 시각화 옵션")
-    map_type = st.radio("표현 방식", ["2D 도트 지도 (Scatter)", "3D 기둥 (Column)", "2D 번짐 열지도 (Heatmap)"])
-    
-    dot_radius = st.slider("도트 크기 / 반지름 (픽셀)", min_value=1, max_value=20, value=3, help="축소 시 2~4px 설정 권장")
-    map_style_choice = st.selectbox("브이월드 배경 테마", ["브이월드 기본 지도 (Base)", "브이월드 심야 지도 (Midnight)"])
-    
-    submit_button = st.form_submit_button(label="🔍 데이터 분석 & 지도 생성", use_container_width=True)
+    return total_rows, dates, grid_count
 
-# ===================================================================
-# --- 지도 시각화 실행 ---
-# ===================================================================
-if submit_button:
-    if not selected_dates:
-        st.warning("⚠️ 최소 하나 이상의 일자를 선택해 주세요.")
+total_rows, available_dates, grid_count = get_db_status()
+
+# ==========================================
+# 3. 사이드바 UI
+# ==========================================
+st.sidebar.title("📌 데이터 현황 및 분석 설정")
+
+# 3-1. 저장된 데이터 현황
+st.sidebar.markdown("### 📊 1. 저장된 데이터 현황")
+if total_rows > 0:
+    st.sidebar.success(f"💾 **인구 DB**: 총 {total_rows:,}행 ({len(available_dates)}개 일자 누적됨)")
+else:
+    st.sidebar.warning("💾 **인구 DB**: 저장된 데이터 없음")
+
+if grid_count > 0:
+    st.sidebar.success(f"📐 **격자 좌표**: {grid_count:,}개 격자 좌표 준비 완료")
+else:
+    st.sidebar.error("📐 **격자 좌표**: CSV/Shapefile 좌표 없음")
+
+st.sidebar.divider()
+
+# 3-2. 분석 조건 설정
+st.sidebar.markdown("### 🎯 2. 분석 조건 설정")
+
+selected_date = st.sidebar.selectbox("분석 일자 선택", available_dates if available_dates else ["데이터 없음"])
+time_range = st.sidebar.slider("시간대 범위 (시)", 0, 23, (8, 23))
+
+gender_options = ["전체", "여성", "남성"]
+selected_gender = st.sidebar.selectbox("성별 선택", gender_options)
+
+age_options = ["전체", "20-24세", "25-29세", "30-34세", "35-39세", "40-44세", "45-49세", "50-54세", "55-59세", "60-64세", "65-69세", "70세 이상"]
+selected_ages = st.sidebar.multiselect("연령대 선택", age_options, default=["20-24세", "25-29세", "30-34세", "35-39세"])
+
+st.sidebar.divider()
+
+# 3-3. 브이월드 지도 시각화 옵션
+st.sidebar.markdown("### 🗺️ 브이월드 지도 시각화 옵션")
+viz_type = st.sidebar.radio("표시 방식", ["2D 도트 지도 (Scatter)", "3D 기둥 (Column)", "2D 번짐 열지도 (Heatmap)"])
+dot_radius = st.sidebar.slider("도트 크기 / 반지름 (픽셀)", 1, 10, 3)
+
+vworld_theme_map = {
+    "브이월드 기본 지도 (Base)": "Base",
+    "브이월드 야간 지도 (Midnight)": "midnight",
+    "브이월드 위성 지도 (Satellite)": "Satellite",
+    "브이월드 백지도 (White)": "white"
+}
+selected_theme_label = st.sidebar.selectbox("브이월드 배경 테마", list(vworld_theme_map.keys()))
+selected_theme = vworld_theme_map[selected_theme_label]
+
+btn_analyze = st.sidebar.button("🔍 데이터 분석 & 지도 생성", use_container_width=True)
+
+# ==========================================
+# 4. 메인 화면 - 타겟 인구 집계 & 지도 표출
+# ==========================================
+st.title("🗺️ 서울시 250m 격자 타겟 생활인구 3D 지도 분석")
+st.caption("2024년 이후 일별 CSV 데이터를 DB에 누적 저장하고, 브이월드(VWorld) 배경 지도에 타겟 유동인구 밀집도를 정밀 시각화합니다.")
+
+if btn_analyze or True:
+    if total_rows == 0 or not os.path.exists(GRID_PATH):
+        st.info("데이터베이스 또는 격자 좌표 데이터가 준비되지 않았습니다.")
     else:
-        gender_keywords = []
-        if "남성" in selected_genders:
-            gender_keywords.extend(['남자', '남성'])
-        if "여성" in selected_genders:
-            gender_keywords.extend(['여자', '여성'])
+        conn = sqlite3.connect(DB_PATH)
+        
+        # SQL 쿼리 조건 구성
+        query_conditions = ["stdr_de = ?", "tmzon BETWEEN ? AND ?"]
+        params = [selected_date, time_range[0], time_range[1]]
+        
+        if selected_gender != "전체":
+            query_conditions.append("gender = ?")
+            params.append(selected_gender)
             
-        selected_cols = [
-            col for col in all_cols
-            if any(gk in col for gk in gender_keywords) and any(ak in col for ak in selected_ages)
-        ]
-                
-        if not selected_cols:
-            st.warning("⚠️ 선택한 조건에 해당하는 데이터 컬럼이 없습니다.")
+        if "전체" not in selected_ages and selected_ages:
+            placeholders = ",".join(["?"] * len(selected_ages))
+            query_conditions.append(f"age_grp IN ({placeholders})")
+            params.extend(selected_ages)
+            
+        where_clause = " WHERE " + " AND ".join(query_conditions)
+        
+        query = f"""
+            SELECT grid_id, SUM(pop_cnt) as target_pop
+            FROM population
+            {where_clause}
+            GROUP BY grid_id
+        """
+        
+        df_pop = pd.read_sql_query(query, conn, params=params)
+        conn.close()
+        
+        if df_pop.empty:
+            st.warning("선택한 조건에 해당하는 데이터가 없습니다.")
         else:
-            with st.spinner("데이터 조회 및 브이월드 지도 생성 중..."):
-                conn = get_db_connection()
-                date_str = "', '".join([str(d) for d in selected_dates])
-                cols_sql = ", ".join([f"`{c}`" for c in selected_cols])
-                
-                query = f"""
-                    SELECT `250M격자`, {cols_sql}
-                    FROM raw_population
-                    WHERE 일자 IN ('{date_str}')
-                      AND 시간 >= {start_hour} AND 시간 <= {end_hour}
-                """
-                
-                df_res = pd.read_sql(query, conn)
-                conn.close()
-                
-                for c in selected_cols:
-                    df_res[c] = pd.to_numeric(df_res[c].replace('*', 0), errors='coerce').fillna(0)
-                
-                df_res['target_sum'] = df_res[selected_cols].sum(axis=1)
-                grid_summary = df_res.groupby('250M격자')['target_sum'].mean().reset_index()
-                grid_summary['250M격자'] = grid_summary['250M격자'].astype(str)
-                
-                if os.path.exists(COORDS_PATH):
-                    coords_df = pd.read_csv(COORDS_PATH)
-                    coords_df['250M격자'] = coords_df['250M격자'].astype(str)
-                    map_df = pd.merge(grid_summary, coords_df, on="250M격자", how="inner")
-                else:
-                    map_df = grid_summary.copy()
-                    map_df['lat'] = 37.5665
-                    map_df['lon'] = 126.9780
-                    st.warning("⚠️ 격자 좌표 파일이 없습니다.")
+            # 좌표 데이터 결합
+            grid_coords = pd.read_csv(GRID_PATH)
+            merged_df = pd.merge(df_pop, grid_coords, on='grid_id', how='inner')
+            
+            # 인구수에 따른 분위수(1~5단계) 및 색상 매핑
+            merged_df['quantile'] = pd.qcut(merged_df['target_pop'], q=5, labels=[1, 2, 3, 4, 5], duplicates='drop')
+            
+            color_map = {
+                1: [68, 1, 84, 160],     # 1단계 (파란 계열)
+                2: [59, 82, 139, 180],
+                3: [33, 145, 140, 200],  # 3단계 (노랑 계열)
+                4: [94, 201, 98, 220],   # 4단계 (주황 계열)
+                5: [253, 231, 37, 240]   # 5단계 (빨강/핫스팟)
+            }
+            merged_df['color'] = merged_df['quantile'].map(color_map)
 
-                if map_df.empty:
-                    st.error("⚠️ 인구 데이터와 좌표 데이터 간 일치하는 격자 ID가 없습니다.")
-                else:
-                    try:
-                        map_df['grade'] = pd.qcut(map_df['target_sum'], q=5, labels=[1, 2, 3, 4, 5], duplicates='drop')
-                    except Exception:
-                        map_df['grade'] = pd.qcut(map_df['target_sum'].rank(method='first'), q=5, labels=[1, 2, 3, 4, 5])
-                    
-                    map_df['grade'] = map_df['grade'].astype(int)
-                    
-                    color_map = {
-                        1: [144, 202, 249, 200],
-                        2: [139, 195, 74, 200],
-                        3: [255, 235, 59, 200],
-                        4: [255, 152, 0, 200],
-                        5: [213, 0, 0, 220]
-                    }
-                    
-                    map_df['color'] = [color_map[g] for g in map_df['grade']]
+            # 지도 범례
+            st.markdown("### 🗺️ 서울시 250m 격자 타겟 생활인구 지도 (브이월드 타일 적용)")
+            st.markdown("""
+                <div style="display: flex; gap: 10px; margin-bottom: 15px;">
+                    <span style="background-color: #440154; color: white; padding: 4px 8px; border-radius: 4px;">🔵 1단계 (0-20%)</span>
+                    <span style="background-color: #3B528B; color: white; padding: 4px 8px; border-radius: 4px;">🟢 2단계 (20-40%)</span>
+                    <span style="background-color: #21918C; color: white; padding: 4px 8px; border-radius: 4px;">🟡 3단계 (40-60%)</span>
+                    <span style="background-color: #5EC962; color: white; padding: 4px 8px; border-radius: 4px;">🟠 4단계 (60-80%)</span>
+                    <span style="background-color: #FDE725; color: black; padding: 4px 8px; border-radius: 4px;">🔴 5단계 (핫스팟 80-100%)</span>
+                </div>
+            """, unsafe_allow_html=True)
 
-                    mid_lat = map_df['lat'].mean()
-                    mid_lon = map_df['lon'].mean()
-                    
-                    view_state = pdk.ViewState(
-                        latitude=mid_lat,
-                        longitude=mid_lon,
-                        zoom=11,
-                        pitch=45 if "3D" in map_type else 0
-                    )
-                    
-                    vworld_type = "Base" if "Base" in map_style_choice else "Midnight"
-                    vworld_tile_url = f"https://api.vworld.kr/req/wmts/1.0.0/{VWORLD_API_KEY}/{vworld_type}/{{z}}/{{y}}/{{x}}.png"
-                    
-                    vworld_background_layer = pdk.Layer(
-                        "TileLayer",
-                        data=vworld_tile_url,
-                        min_zoom=0,
-                        max_zoom=19,
-                        tile_size=256,
-                    )
-                    
-                    if "Scatter" in map_type:
-                        data_layer = pdk.Layer(
-                            "ScatterplotLayer",
-                            data=map_df,
-                            get_position=["lon", "lat"],
-                            get_fill_color="color",
-                            radius_min_pixels=dot_radius,
-                            radius_max_pixels=dot_radius * 2,
-                            pickable=True,
-                            opacity=0.85
-                        )
-                    elif "3D" in map_type:
-                        data_layer = pdk.Layer(
-                            "ColumnLayer",
-                            data=map_df,
-                            get_position=["lon", "lat"],
-                            get_elevation="target_sum",
-                            elevation_scale=0.3,
-                            radius=80,
-                            get_fill_color="color",
-                            pickable=True,
-                            auto_highlight=True
-                        )
-                    else:
-                        data_layer = pdk.Layer(
-                            "HeatmapLayer",
-                            data=map_df,
-                            get_position=["lon", "lat"],
-                            get_weight="target_sum",
-                            radius_pixels=dot_radius * 2,
-                            intensity=1,
-                            threshold=0.05
-                        )
-                    
-                    deck = pdk.Deck(
-                        layers=[vworld_background_layer, data_layer],
-                        initial_view_state=view_state,
-                        map_style=None,
-                        tooltip={"html": "<b>격자 ID:</b> {250M격자}<br/><b>평균 타겟 인구:</b> {target_sum:.1f}명 (<b>{grade}단계</b>)"}
-                    )
-                    
-                    st.subheader("🗺️ 서울시 250m 격자 타겟 생활인구 지도 (브이월드 타일 적용)")
-                    
-                    st.markdown("""
-                    <div style="display: flex; gap: 10px; margin-bottom: 12px; font-weight: bold; font-size: 13px;">
-                        <span style="background-color: #90CAF9; color: #000; padding: 4px 8px; border-radius: 4px;">🔵 1단계 (0~20%)</span>
-                        <span style="background-color: #8BC34A; color: #000; padding: 4px 8px; border-radius: 4px;">🟢 2단계 (20~40%)</span>
-                        <span style="background-color: #FFEB3B; color: #000; padding: 4px 8px; border-radius: 4px;">🟡 3단계 (40~60%)</span>
-                        <span style="background-color: #FF9800; color: #fff; padding: 4px 8px; border-radius: 4px;">🟠 4단계 (60~80%)</span>
-                        <span style="background-color: #D50000; color: #fff; padding: 4px 8px; border-radius: 4px;">🔴 5단계 (핫스팟 80~100%)</span>
-                    </div>
-                    """, unsafe_allow_html=True)
-                    
-                    st.pydeck_chart(deck)
-                    
-                    st.subheader("📊 타겟 유동인구 상위 20개 격자")
-                    st.dataframe(grid_summary.sort_values(by='target_sum', ascending=False).head(20), use_container_width=True)
+            # ----------------------------------------------------
+            # 핵심 핵심: 브이월드 WMTS 타일 레이어 생성
+            # Python f-string 이스케이프: {{z}}/{{y}}/{{x}} 사용
+            # ----------------------------------------------------
+            vworld_tile_url = f"https://api.vworld.kr/req/wmts/1.0.0/{VWORLD_API_KEY}/{selected_theme}/{{z}}/{{y}}/{{x}}.png"
+
+            vworld_layer = pdk.Layer(
+                "TileLayer",
+                data=vworld_tile_url,
+                min_zoom=0,
+                max_zoom=19,
+                tile_size=256,
+            )
+
+            # 데이터 시각화 레이어 설정
+            if "Scatter" in viz_type:
+                data_layer = pdk.Layer(
+                    "ScatterplotLayer",
+                    merged_df,
+                    get_position=["lon", "lat"],
+                    get_color="color",
+                    get_radius=dot_radius * 15,
+                    pickable=True,
+                    opacity=0.8,
+                )
+            elif "Column" in viz_type:
+                max_pop = merged_df['target_pop'].max()
+                merged_df['elevation'] = (merged_df['target_pop'] / max_pop) * 2000
+                data_layer = pdk.Layer(
+                    "ColumnLayer",
+                    merged_df,
+                    get_position=["lon", "lat"],
+                    get_elevation="elevation",
+                    elevation_scale=1,
+                    radius=100,
+                    get_fill_color="color",
+                    pickable=True,
+                    extruded=True,
+                )
+            else:  # Heatmap
+                data_layer = pdk.Layer(
+                    "HeatmapLayer",
+                    merged_df,
+                    get_position=["lon", "lat"],
+                    get_weight="target_pop",
+                    radius_pixels=dot_radius * 10,
+                )
+
+            # View State 설정 (서울 중심)
+            view_state = pdk.ViewState(
+                longitude=126.9780,
+                latitude=37.5665,
+                zoom=11,
+                pitch=40 if "Column" in viz_type else 0,
+                bearing=0
+            )
+
+            # ----------------------------------------------------
+            # 핵심: map_style=None 지정하여 Mapbox 기본 배경을 제거하고 브이월드만 노출
+            # ----------------------------------------------------
+            r = pdk.Deck(
+                layers=[vworld_layer, data_layer],
+                initial_view_state=view_state,
+                map_style=None,
+                tooltip={"text": "격자ID: {grid_id}\n타겟 인구수: {target_pop}명"}
+            )
+
+            st.pydeck_chart(r, use_container_width=True)
+
+            # 상위 20개 격자 데이터 출력
+            st.markdown("### 📊 타겟 유동인구 상위 20개 격자")
+            top20_df = merged_df.sort_values(by='target_pop', ascending=False).head(20)
+            st.dataframe(
+                top20_df[['grid_id', 'target_pop', 'lon', 'lat']].rename(
+                    columns={'grid_id': '격자 ID', 'target_pop': '타겟 인구수(명)', 'lon': '경도', 'lat': '위도'}
+                ),
+                use_container_width=True
+            )
