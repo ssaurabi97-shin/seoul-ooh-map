@@ -109,6 +109,13 @@ except Exception as e:
     st.caption(f"데이터 위치: {DATA_BASE}")
     st.stop()
 
+if not manifest.get("dates") or not manifest.get("columns"):
+    st.title("🗺️ 서울시 250m 격자 타겟 생활인구 지도")
+    st.warning("변환된 인구 데이터가 아직 없습니다. (manifest.json의 dates가 비어 있음)\n\n"
+               "build_data.py를 실행해 data/daily/*.parquet 과 manifest.json 을 생성한 뒤 다시 확인하세요.")
+    st.caption(f"데이터 위치: {DATA_BASE}")
+    st.stop()
+
 if not os.path.exists(GRID_PATH):
     st.title("🗺️ 서울시 250m 격자 타겟 생활인구 지도")
     st.error("grid_coords.csv가 저장소에 없습니다. build_data.py로 생성해 업로드하세요.")
