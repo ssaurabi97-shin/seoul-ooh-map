@@ -22,15 +22,18 @@ GRID_PATH = os.path.join(BASE_DIR, "grid_coords.csv")
 WEEKDAYS = ["월", "화", "수", "목", "금", "토", "일"]
 DEFAULT_AGES = ["20-24세", "25-29세", "30-34세", "35-39세"]
 
+# 단계 경계(누적 비율)와 색상: 낮음(초록) -> 높음(빨강). 한강(파랑)과 구분되도록 파랑 계열은 쓰지 않음
+LEVEL_BINS = [0, 0.25, 0.50, 0.80, 0.90, 1.0]
+LEVEL_LABELS = {1: "0-25%", 2: "26-50%", 3: "51-80%", 4: "81-90%", 5: "91-100%"}
 LEVEL_COLORS = {
-    1: [49, 130, 189, 170],
-    2: [107, 174, 214, 190],
-    3: [254, 217, 118, 210],
-    4: [253, 141, 60, 225],
-    5: [215, 25, 28, 240],
+    1: [143, 209, 117, 210],   # 연한 초록
+    2: [46, 158, 79, 220],     # 진한 초록
+    3: [254, 217, 118, 220],   # 노랑
+    4: [253, 141, 60, 230],    # 주황
+    5: [215, 25, 28, 240],     # 빨강
 }
-LEVEL_HEX = {1: "#3182BD", 2: "#6BAED6", 3: "#FED976", 4: "#FD8D3C", 5: "#D7191C"}
-LEVEL_TEXT = {1: "white", 2: "black", 3: "black", 4: "black", 5: "white"}
+LEVEL_HEX = {1: "#8FD175", 2: "#2E9E4F", 3: "#FED976", 4: "#FD8D3C", 5: "#D7191C"}
+LEVEL_TEXT = {1: "black", 2: "white", 3: "black", 4: "black", 5: "white"}
 
 
 def get_setting(name, default=""):
@@ -231,7 +234,9 @@ if merged.empty:
     st.warning("선택한 조건에 해당하는 데이터가 없습니다. (격자ID 불일치 가능)")
     st.stop()
 
-merged["level"] = pd.qcut(merged["target_pop"].rank(method="first"), 5, labels=False) + 1
+# 인구가 적은 순서대로 순위를 매긴 뒤 누적 비율 구간(0-25-50-80-90-100%)으로 5단계 분류
+pct = merged["target_pop"].rank(method="first") / len(merged)
+merged["level"] = pd.cut(pct, bins=LEVEL_BINS, labels=[1, 2, 3, 4, 5], include_lowest=True).astype(int)
 merged["color"] = merged["level"].map(LEVEL_COLORS)
 merged["pop_label"] = merged["target_pop"].round(0).astype(int)
 
@@ -254,7 +259,7 @@ st.caption(f"적용 조건: {d_start:%Y-%m-%d} ~ {d_end:%Y-%m-%d} ({n_days}일, 
 
 legend = "".join(
     f'<span style="background:{LEVEL_HEX[i]};color:{LEVEL_TEXT[i]};padding:4px 10px;'
-    f'border-radius:4px;margin-right:6px;">{i}단계 ({(i-1)*20}-{i*20}%)</span>'
+    f'border-radius:4px;margin-right:6px;">{i}단계 ({LEVEL_LABELS[i]})</span>'
     for i in range(1, 6)
 )
 st.markdown(f'<div style="margin:8px 0 12px 0;">{legend}</div>', unsafe_allow_html=True)
