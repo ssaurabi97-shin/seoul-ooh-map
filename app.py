@@ -45,7 +45,7 @@ def get_setting(name, default=""):
 DATA_BASE = get_setting("DATA_BASE_URL", os.path.join(BASE_DIR, "data")).rstrip("/")
 IS_REMOTE = DATA_BASE.startswith("http")
 # 한 번에 집계할 최대 일수 (원격 저장소 읽기 속도 보호). Secrets의 MAX_DAYS로 조정 가능
-MAX_DAYS = int(get_setting("MAX_DAYS", "92"))
+MAX_DAYS = int(get_setting("MAX_DAYS", "1000"))
 
 
 # ==========================================
@@ -89,7 +89,7 @@ def get_con(remote):
     return con
 
 
-@st.cache_data(ttl=3600, show_spinner="선택한 기간의 인구 데이터를 집계하는 중...")
+@st.cache_data(ttl=3600, show_spinner=False)
 def query_target(base, dates, cols, h0, h1):
     """일별 Parquet에서 필요한 컬럼만 읽어 격자별 합계를 계산 (DuckDB)"""
     if not all(re.fullmatch(r"[a-z0-9_]+", c) for c in cols):
@@ -157,8 +157,6 @@ with st.sidebar.form("filters"):
     time_range = st.slider("시간대 범위 (시)", 0, 23, (8, 23))
     selected_gender = st.selectbox("성별", ["전체", "여성", "남성"])
     selected_ages = st.multiselect("연령대", age_options, default=default_ages)
-    agg_mode = st.radio("지도 색상 기준", ["시간당 평균 인구", "일평균 시간대 합계 (연인원)"],
-                        help="평균: 선택 시간대·일자의 시간당 평균 인구 / 합계: 하루 기준 선택 시간대 인구를 모두 더한 값")
 
     st.markdown("### 🗺️ 지도 옵션")
     viz_type = st.radio("표시 방식", ["2D 도트 (Scatter)", "3D 기둥 (Column)", "2D 열지도 (Heatmap)"])
@@ -171,7 +169,7 @@ with st.sidebar.form("filters"):
 if submitted:
     st.session_state["params"] = dict(
         rng=rng, wd=wd, time_range=time_range, gender=selected_gender, ages=selected_ages,
-        agg_mode=agg_mode, viz_type=viz_type, dot_size=dot_size, theme_label=theme_label,
+        viz_type=viz_type, dot_size=dot_size, theme_label=theme_label,
         api_key=secret_key or form_key,
     )
 
@@ -187,7 +185,7 @@ if P is None:
     st.stop()
 
 time_range, selected_gender, selected_ages = P["time_range"], P["gender"], P["ages"]
-agg_mode, viz_type, dot_size, api_key = P["agg_mode"], P["viz_type"], P["dot_size"], P["api_key"]
+viz_type, dot_size, api_key = P["viz_type"], P["dot_size"], P["api_key"]
 theme = theme_map[P["theme_label"]]
 
 # 기간·요일 -> 실제 데이터가 있는 일자 목록
@@ -204,7 +202,7 @@ if not selected_dates:
     st.warning("선택한 조건에 해당하는 일자가 없습니다.")
     st.stop()
 if len(selected_dates) > MAX_DAYS:
-    st.warning(f"한 번에 최대 {MAX_DAYS}일까지 집계할 수 있습니다. (현재 {len(selected_dates)}일) 기간을 줄여주세요.")
+    st.warning(f"한 번에 최대 {MAX_DAYS}일까지 집계할 수 있습니다. (현재 {len(selected_dates)}일) 기간을 줄이거나 Secrets의 MAX_DAYS 값을 늘려주세요.")
     st.stop()
 if not selected_ages:
     st.warning("연령대를 1개 이상 선택하세요.")
@@ -217,17 +215,15 @@ if not target_cols:
     st.stop()
 
 try:
-    df_pop = query_target(DATA_BASE, selected_dates, target_cols, time_range[0], time_range[1])
+    with st.spinner(f"{len(selected_dates)}일치 인구 데이터를 집계하는 중... (기간이 길면 1~2분 걸릴 수 있습니다)"):
+        df_pop = query_target(DATA_BASE, selected_dates, target_cols, time_range[0], time_range[1])
 except Exception as e:
     st.error(f"데이터 집계 중 오류: {e}")
     st.stop()
 
 n_days = len(selected_dates)
 n_hours = time_range[1] - time_range[0] + 1
-if agg_mode.startswith("시간당"):
-    df_pop["target_pop"] = df_pop["s"] / (n_days * n_hours)
-else:
-    df_pop["target_pop"] = df_pop["s"] / n_days
+df_pop["target_pop"] = df_pop["s"] / (n_days * n_hours)  # 지도 색상·높이 기준: 시간당 평균 인구
 df_pop["grid_id"] = df_pop["grid_id"].astype(str).str.strip()
 
 merged = df_pop[["grid_id", "s", "target_pop"]].merge(load_grid(), on="grid_id", how="inner")
@@ -340,7 +336,7 @@ function start(){
     getTooltip:function(o){
       const d=o.object;
       if(!d || d.i===undefined) return null;
-      return {html:'격자ID: '+d.i+'<br>타겟 인구: '+Number(d.p).toLocaleString()+'명',
+      return {html:'격자ID: '+d.i+'<br>시간당 평균 타겟 인구: '+Number(d.p).toLocaleString()+'명',
               style:{backgroundColor:'rgba(30,30,30,.9)',color:'#fff',fontSize:'12px'}};
     }
   });
