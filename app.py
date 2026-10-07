@@ -140,54 +140,65 @@ all_dates = pd.to_datetime(manifest["dates"], format="%Y%m%d")
 colmap = {c: tuple(v) for c, v in manifest["columns"].items()}
 st.sidebar.success(f"💾 {len(all_dates)}일 데이터 ({all_dates.min():%Y-%m-%d} ~ {all_dates.max():%Y-%m-%d})")
 
-# --- 기간 / 요일 ---
-mode = st.sidebar.radio("일자 선택 방식", ["단일 일자", "기간 평균"], horizontal=True)
-if mode == "단일 일자":
-    d = st.sidebar.date_input("분석 일자", value=all_dates.max().date(),
-                              min_value=all_dates.min().date(), max_value=all_dates.max().date())
-    picked = all_dates[all_dates.normalize() == pd.Timestamp(d)]
-    selected_days = list(picked)
-else:
-    default_start = max(all_dates.min(), all_dates.max() - pd.Timedelta(days=13))
-    rng = st.sidebar.date_input("분석 기간", value=(default_start.date(), all_dates.max().date()),
-                                min_value=all_dates.min().date(), max_value=all_dates.max().date())
-    if not isinstance(rng, (tuple, list)) or len(rng) != 2:
-        st.sidebar.info("시작일과 종료일을 모두 선택하세요.")
-        st.stop()
-    wd = st.sidebar.multiselect("포함할 요일", WEEKDAYS, default=WEEKDAYS)
-    wd_idx = [WEEKDAYS.index(w) for w in wd]
-    in_range = all_dates[(all_dates >= pd.Timestamp(rng[0])) & (all_dates <= pd.Timestamp(rng[1]))]
-    selected_days = [x for x in in_range if x.weekday() in wd_idx]
-
-selected_dates = tuple(x.strftime("%Y%m%d") for x in selected_days)
-
-# --- 시간 / 성별 / 연령 ---
-time_range = st.sidebar.slider("시간대 범위 (시)", 0, 23, (8, 23))
-selected_gender = st.sidebar.selectbox("성별", ["전체", "여성", "남성"])
+# --- 분석 조건 입력 폼: '실행하기'를 누를 때만 데이터를 조회합니다 ---
 age_options = sorted({a for _, a in colmap.values()}, key=age_sort_key)
 default_ages = [a for a in DEFAULT_AGES if a in age_options] or age_options
-selected_ages = st.sidebar.multiselect("연령대", age_options, default=default_ages)
-
-agg_mode = st.sidebar.radio("집계 방식", ["시간당 평균 인구", "일평균 시간대 합계 (연인원)"],
-                            help="평균: 선택 시간대·일자의 시간당 평균 인구 / 합계: 하루 기준 선택 시간대 인구를 모두 더한 값")
-
-st.sidebar.divider()
-st.sidebar.markdown("### 🗺️ 지도 옵션")
-viz_type = st.sidebar.radio("표시 방식", ["2D 도트 (Scatter)", "3D 기둥 (Column)", "2D 열지도 (Heatmap)"])
-dot_size = st.sidebar.slider("도트 크기 / 열지도 반경", 1, 10, 3)
 theme_map = {"기본 (Base)": "Base", "야간 (Midnight)": "midnight",
              "위성 (Satellite)": "Satellite", "백지도 (White)": "white"}
-theme = theme_map[st.sidebar.selectbox("배경 테마", list(theme_map))]
+default_start = max(all_dates.min(), all_dates.max() - pd.Timedelta(days=13))
+secret_key = get_setting("VWORLD_API_KEY")
 
-api_key = get_setting("VWORLD_API_KEY")
-if not api_key:
-    api_key = st.sidebar.text_input("브이월드 API 키", type="password")
+with st.sidebar.form("filters"):
+    st.markdown("### 🎯 분석 조건")
+    rng = st.date_input("분석 기간 (하루만 보려면 시작일=종료일)",
+                        value=(default_start.date(), all_dates.max().date()),
+                        min_value=all_dates.min().date(), max_value=all_dates.max().date())
+    wd = st.multiselect("포함할 요일", WEEKDAYS, default=WEEKDAYS)
+    time_range = st.slider("시간대 범위 (시)", 0, 23, (8, 23))
+    selected_gender = st.selectbox("성별", ["전체", "여성", "남성"])
+    selected_ages = st.multiselect("연령대", age_options, default=default_ages)
+    agg_mode = st.radio("지도 색상 기준", ["시간당 평균 인구", "일평균 시간대 합계 (연인원)"],
+                        help="평균: 선택 시간대·일자의 시간당 평균 인구 / 합계: 하루 기준 선택 시간대 인구를 모두 더한 값")
+
+    st.markdown("### 🗺️ 지도 옵션")
+    viz_type = st.radio("표시 방식", ["2D 도트 (Scatter)", "3D 기둥 (Column)", "2D 열지도 (Heatmap)"])
+    dot_size = st.slider("도트 크기 / 열지도 반경", 1, 10, 3)
+    theme_label = st.selectbox("배경 테마", list(theme_map))
+    form_key = "" if secret_key else st.text_input("브이월드 API 키", type="password")
+
+    submitted = st.form_submit_button("🔍 실행하기", type="primary")
+
+if submitted:
+    st.session_state["params"] = dict(
+        rng=rng, wd=wd, time_range=time_range, gender=selected_gender, ages=selected_ages,
+        agg_mode=agg_mode, viz_type=viz_type, dot_size=dot_size, theme_label=theme_label,
+        api_key=secret_key or form_key,
+    )
 
 # ==========================================
 # 3. 집계
 # ==========================================
 st.title("🗺️ 서울시 250m 격자 타겟 생활인구 지도")
-st.caption("성별·연령·시간대·기간 조건으로 타겟 인구를 집계해 브이월드 배경지도 위에 표시합니다.")
+st.caption("왼쪽에서 조건을 모두 설정한 뒤 '실행하기'를 누르면 해당 조건의 타겟 인구를 집계해 지도에 표시합니다.")
+
+P = st.session_state.get("params")
+if P is None:
+    st.info("👈 왼쪽 사이드바에서 분석 조건을 설정하고 **실행하기**를 눌러주세요.")
+    st.stop()
+
+time_range, selected_gender, selected_ages = P["time_range"], P["gender"], P["ages"]
+agg_mode, viz_type, dot_size, api_key = P["agg_mode"], P["viz_type"], P["dot_size"], P["api_key"]
+theme = theme_map[P["theme_label"]]
+
+# 기간·요일 -> 실제 데이터가 있는 일자 목록
+rng_sel = P["rng"] if isinstance(P["rng"], (tuple, list)) else (P["rng"],)
+if len(rng_sel) == 0:
+    st.warning("분석 기간을 선택하세요.")
+    st.stop()
+d_start, d_end = rng_sel[0], rng_sel[-1]  # 하루만 고른 경우 시작일=종료일
+wd_idx = [WEEKDAYS.index(w) for w in P["wd"]]
+in_range = all_dates[(all_dates >= pd.Timestamp(d_start)) & (all_dates <= pd.Timestamp(d_end))]
+selected_dates = tuple(x.strftime("%Y%m%d") for x in in_range if x.weekday() in wd_idx)
 
 if not selected_dates:
     st.warning("선택한 조건에 해당하는 일자가 없습니다.")
@@ -215,13 +226,11 @@ n_days = len(selected_dates)
 n_hours = time_range[1] - time_range[0] + 1
 if agg_mode.startswith("시간당"):
     df_pop["target_pop"] = df_pop["s"] / (n_days * n_hours)
-    unit = "시간당 평균"
 else:
     df_pop["target_pop"] = df_pop["s"] / n_days
-    unit = "일평균 연인원"
 df_pop["grid_id"] = df_pop["grid_id"].astype(str).str.strip()
 
-merged = df_pop[["grid_id", "target_pop"]].merge(load_grid(), on="grid_id", how="inner")
+merged = df_pop[["grid_id", "s", "target_pop"]].merge(load_grid(), on="grid_id", how="inner")
 if merged.empty:
     st.warning("선택한 조건에 해당하는 데이터가 없습니다. (격자ID 불일치 가능)")
     st.stop()
@@ -236,10 +245,16 @@ with st.expander("🔎 데이터 점검 정보"):
     st.write(f"사용 컬럼 {len(target_cols)}개: {', '.join(target_cols)}")
     st.write(f"인구 격자 {len(df_pop):,}개 중 좌표 매칭 {len(merged):,}개")
 
-c1, c2, c3 = st.columns(3)
-c1.metric("표시 격자 수", f"{len(merged):,}")
-c2.metric(f"타겟 인구 총합 ({unit})", f"{merged['target_pop'].sum():,.0f}명")
-c3.metric("격자당 최대", f"{merged['target_pop'].max():,.0f}명")
+# 타겟 인구 총합: 지도에 표시된 격자 전체 기준
+total_sum = float(merged["s"].sum())  # 선택 일자·시간대·격자의 인구를 모두 더한 값
+m1, m2 = st.columns(2)
+m1.metric("타겟 인구 총합 (시간당 평균)", f"{total_sum / (n_days * n_hours):,.0f}명",
+          help="선택한 일자·시간대의 시간별 인구를 평균낸 값 (모든 격자 합계)")
+m2.metric("타겟 인구 총합 (기간 총)", f"{total_sum:,.0f}명",
+          help="선택한 모든 일자·시간대의 시간별 인구를 전부 더한 값 (연인원)")
+wd_text = "전체 요일" if len(P["wd"]) == 7 else "·".join(P["wd"])
+st.caption(f"적용 조건: {d_start:%Y-%m-%d} ~ {d_end:%Y-%m-%d} ({n_days}일, {wd_text}) · "
+           f"{time_range[0]}~{time_range[1]}시 · 성별 {selected_gender} · 연령 {', '.join(selected_ages)}")
 
 legend = "".join(
     f'<span style="background:{LEVEL_HEX[i]};color:{LEVEL_TEXT[i]};padding:4px 10px;'
