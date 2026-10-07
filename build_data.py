@@ -7,9 +7,12 @@
   - data/manifest.json           : 날짜 목록 + 컬럼 정보 (외부 저장소에 업로드)
   - grid_coords.csv              : 격자ID, lon, lat (GitHub 앱 저장소에 업로드)
 
-사용법
-  pip install -r requirements-build.txt
-  python build_data.py --csv-dir "C:/원본CSV폴더" --shp match.shp
+사용법 (예: 2024-07-01 ~ 2026-08-31 구간만 변환)
+  pip install pandas pyarrow            # grid_coords.csv 가 이미 있으면 이것만으로 충분
+  python build_data.py --csv-dir "C:/원본CSV폴더" --start 20240701 --end 20260831
+
+  - grid_coords.csv 가 없으면 Shapefile로 새로 만듭니다 (pip install geopandas pyogrio shapely, --shp 지정)
+  - --decimals 1 : 인구수를 소수 1자리로 반올림해 저장 (용량이 크게 줄어듭니다. 끄려면 --decimals -1)
 """
 import argparse
 import glob
@@ -17,7 +20,6 @@ import json
 import os
 import re
 
-import geopandas as gpd
 import pandas as pd
 
 ID_CANDS = ["250M격자", "250m격자", "격자ID", "격자id", "GRID_ID", "격자코드", "집계구코드", "TOT_REG_CD",
@@ -142,6 +144,8 @@ def convert_csv(path):
 
 # ---------------- 격자 좌표 ----------------
 def build_grid_coords(shp_path, sample_ids, out_csv):
+    import geopandas as gpd  # 격자 좌표를 새로 만들 때만 필요
+
     gdf = gpd.read_file(shp_path)
     if gdf.crs is None:  # .prj 누락 대비: 좌표 범위로 추정
         minx, miny, maxx, maxy = gdf.total_bounds
@@ -171,12 +175,23 @@ def build_grid_coords(shp_path, sample_ids, out_csv):
 
 
 # ---------------- 메인 ----------------
+def save_manifest(path, manifest):
+    manifest["dates"] = sorted(set(manifest["dates"]))
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--csv-dir", default=".", help="원본 일별 CSV 폴더")
     ap.add_argument("--out-dir", default="data", help="Parquet 출력 폴더")
-    ap.add_argument("--shp", default="match.shp", help="격자 Shapefile 경로")
+    ap.add_argument("--shp", default="match.shp", help="격자 Shapefile 경로 (grid_coords.csv가 없을 때만 사용)")
     ap.add_argument("--grid-out", default="grid_coords.csv")
+    ap.add_argument("--start", default=None, help="변환 시작일 YYYYMMDD (포함)")
+    ap.add_argument("--end", default=None, help="변환 종료일 YYYYMMDD (포함)")
+    ap.add_argument("--decimals", type=int, default=1, help="인구수 반올림 자리수 (음수면 반올림 안 함)")
     args = ap.parse_args()
 
     daily_dir = os.path.join(args.out_dir, "daily")
@@ -191,39 +206,57 @@ def main():
     for p in glob.glob(os.path.join(args.csv_dir, "*.csv")):
         name = os.path.basename(p)
         m = re.search(r"(\d{8})", name)
-        if m and name.lower() != "grid_coords.csv":
-            files[m.group(1)] = p
-
-    first_ids = None
-    for date, path in sorted(files.items()):
-        out_path = os.path.join(daily_dir, f"{date}.parquet")
-        if os.path.exists(out_path):
+        if not m or name.lower() == "grid_coords.csv":
             continue
-        print(f"변환 중: {os.path.basename(path)}")
-        df, meta = convert_csv(path)
+        d = m.group(1)
+        if (args.start and d < args.start) or (args.end and d > args.end):
+            continue
+        files[d] = p
 
-        if manifest["columns"]:  # 기존 컬럼 구성에 맞춤
-            known = list(manifest["columns"])
-            for c in known:
-                if c not in df.columns:
-                    df[c] = 0.0
-            extra = [c for c in meta if c not in manifest["columns"]]
-            if extra:
-                print(f"  [경고] 기존에 없던 컬럼 무시: {extra}")
-            df = df[["grid_id", "hour"] + known]
-        else:
-            manifest["columns"] = meta
-        df.to_parquet(out_path, compression="zstd", index=False)
-        print(f"  -> {out_path} ({os.path.getsize(out_path)/1e6:.1f}MB, {len(df):,}행)")
-        if first_ids is None:
-            first_ids = df["grid_id"].unique()
-        if date not in manifest["dates"]:
-            manifest["dates"].append(date)
+    total = len(files)
+    print(f"대상 CSV {total}개" + (f" ({min(files)} ~ {max(files)})" if files else ""))
+    first_ids, done, skipped = None, 0, 0
+    try:
+        for n, (date, path) in enumerate(sorted(files.items()), 1):
+            out_path = os.path.join(daily_dir, f"{date}.parquet")
+            if os.path.exists(out_path) and manifest["columns"]:
+                if date not in manifest["dates"]:  # 이전 실행이 중간에 끊긴 경우 복구
+                    manifest["dates"].append(date)
+                skipped += 1
+                continue
+            print(f"[{n}/{total}] 변환 중: {os.path.basename(path)}")
+            df, meta = convert_csv(path)
+            pop_cols = [c for c in df.columns if c not in ("grid_id", "hour")]
+            if args.decimals >= 0:
+                df[pop_cols] = df[pop_cols].round(args.decimals).astype("float32")
 
-    manifest["dates"] = sorted(set(manifest["dates"]))
-    with open(manifest_path, "w", encoding="utf-8") as f:
-        json.dump(manifest, f, ensure_ascii=False)
-    print(f"manifest 갱신: 총 {len(manifest['dates'])}일")
+            if manifest["columns"]:  # 기존 컬럼 구성에 맞춤
+                known = list(manifest["columns"])
+                for c in known:
+                    if c not in df.columns:
+                        df[c] = 0.0
+                extra = [c for c in meta if c not in manifest["columns"]]
+                if extra:
+                    print(f"  [경고] 기존에 없던 컬럼 무시: {extra}")
+                df = df[["grid_id", "hour"] + known]
+            else:
+                manifest["columns"] = meta
+            # row group을 작게 나눠 시간대 필터 시 필요한 부분만 읽도록 함
+            df.to_parquet(out_path, compression="zstd", index=False, row_group_size=60000)
+            print(f"  -> {os.path.getsize(out_path)/1e6:.1f}MB, {len(df):,}행")
+            if first_ids is None:
+                first_ids = df["grid_id"].unique()
+            if date not in manifest["dates"]:
+                manifest["dates"].append(date)
+            done += 1
+            if done % 20 == 0:  # 중간 저장: 끊겨도 진행분이 보존됨
+                save_manifest(manifest_path, manifest)
+    finally:
+        save_manifest(manifest_path, manifest)
+
+    size_mb = sum(os.path.getsize(f) for f in glob.glob(os.path.join(daily_dir, "*.parquet"))) / 1e6
+    print(f"완료: 이번 변환 {done}개, 건너뜀 {skipped}개 / manifest 총 {len(manifest['dates'])}일 "
+          f"/ Parquet 총 {size_mb:,.0f}MB")
 
     if not os.path.exists(args.grid_out):
         if first_ids is None and manifest["dates"]:

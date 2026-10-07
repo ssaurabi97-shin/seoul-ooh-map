@@ -3,3 +3,4 @@ pyarrow
 geopandas
 pyogrio
 shapely
+huggingface_hub

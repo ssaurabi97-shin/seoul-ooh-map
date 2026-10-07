@@ -19,7 +19,6 @@ st.set_page_config(
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 GRID_PATH = os.path.join(BASE_DIR, "grid_coords.csv")
-MAX_DAYS = 92  # 한 번에 집계할 최대 일수 (원격 저장소 읽기 속도 보호)
 WEEKDAYS = ["월", "화", "수", "목", "금", "토", "일"]
 DEFAULT_AGES = ["20-24세", "25-29세", "30-34세", "35-39세"]
 
@@ -45,6 +44,8 @@ def get_setting(name, default=""):
 # 데이터 위치: 외부 저장소 URL(권장) 또는 로컬 data 폴더
 DATA_BASE = get_setting("DATA_BASE_URL", os.path.join(BASE_DIR, "data")).rstrip("/")
 IS_REMOTE = DATA_BASE.startswith("http")
+# 한 번에 집계할 최대 일수 (원격 저장소 읽기 속도 보호). Secrets의 MAX_DAYS로 조정 가능
+MAX_DAYS = int(get_setting("MAX_DAYS", "92"))
 
 
 # ==========================================
@@ -53,7 +54,8 @@ IS_REMOTE = DATA_BASE.startswith("http")
 @st.cache_data(ttl=600, show_spinner="데이터 목록 확인 중...")
 def load_manifest(base):
     if base.startswith("http"):
-        with urllib.request.urlopen(f"{base}/manifest.json", timeout=30) as r:
+        req = urllib.request.Request(f"{base}/manifest.json", headers={"User-Agent": "seoul-ooh-map"})
+        with urllib.request.urlopen(req, timeout=30) as r:
             return json.loads(r.read().decode("utf-8"))
     with open(os.path.join(base, "manifest.json"), encoding="utf-8") as f:
         return json.load(f)
@@ -70,25 +72,39 @@ def sql_str(s):
     return "'" + str(s).replace("'", "''") + "'"
 
 
+@st.cache_resource
+def get_con(remote):
+    con = duckdb.connect()
+    if remote:
+        try:
+            con.execute("INSTALL httpfs")
+        except Exception:
+            pass
+        con.execute("LOAD httpfs")
+        for q in ("SET enable_http_metadata_cache=true", "SET http_keep_alive=true"):
+            try:
+                con.execute(q)
+            except Exception:
+                pass
+    return con
+
+
 @st.cache_data(ttl=3600, show_spinner="선택한 기간의 인구 데이터를 집계하는 중...")
 def query_target(base, dates, cols, h0, h1):
     """일별 Parquet에서 필요한 컬럼만 읽어 격자별 합계를 계산 (DuckDB)"""
     if not all(re.fullmatch(r"[a-z0-9_]+", c) for c in cols):
         raise ValueError("허용되지 않은 컬럼명")
     paths = [f"{base}/daily/{d}.parquet" for d in dates]
-    con = duckdb.connect()
-    if base.startswith("http"):
-        try:
-            con.execute("INSTALL httpfs")
-        except Exception:
-            pass
-        con.execute("LOAD httpfs")
-    expr = " + ".join(f'"{c}"' for c in cols)
-    files = "[" + ",".join(sql_str(p) for p in paths) + "]"
-    sql = (f"SELECT grid_id, SUM({expr}) AS s "
-           f"FROM read_parquet({files}, union_by_name=true) "
-           f"WHERE hour BETWEEN {int(h0)} AND {int(h1)} GROUP BY grid_id")
-    return con.execute(sql).df()
+    cur = get_con(base.startswith("http")).cursor()
+    try:
+        expr = " + ".join(f'"{c}"' for c in cols)
+        files = "[" + ",".join(sql_str(p) for p in paths) + "]"
+        sql = (f"SELECT grid_id, SUM({expr}) AS s "
+               f"FROM read_parquet({files}, union_by_name=true) "
+               f"WHERE hour BETWEEN {int(h0)} AND {int(h1)} GROUP BY grid_id")
+        return cur.execute(sql).df()
+    finally:
+        cur.close()
 
 
 def age_sort_key(label):
