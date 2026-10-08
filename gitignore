@@ -1,0 +1,15 @@
+# 원본 CSV와 변환 데이터는 GitHub에 올리지 않음 (외부 저장소 사용)
+*.csv
+!grid_coords.csv
+!grid_dong.csv
+data/
+*.shp
+*.shx
+*.dbf
+*.prj
+*.cpg
+*.qix
+*.qmd
+seoul_population.db
+__pycache__/
+.streamlit/secrets.toml

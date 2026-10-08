@@ -5,6 +5,8 @@ import urllib.request
 
 import duckdb
 import pandas as pd
+import plotly.colors as pc
+import plotly.graph_objects as go
 import streamlit as st
 
 # ==========================================
@@ -19,6 +21,7 @@ st.set_page_config(
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 GRID_PATH = os.path.join(BASE_DIR, "grid_coords.csv")
+DONG_PATH = os.path.join(BASE_DIR, "grid_dong.csv")  # 격자ID -> 자치구/행정동 (build_grid_dong.py로 생성)
 WEEKDAYS = ["월", "화", "수", "목", "금", "토", "일"]
 DEFAULT_AGES = ["20-24세", "25-29세", "30-34세", "35-39세"]
 
@@ -69,6 +72,15 @@ def load_grid():
     g = pd.read_csv(GRID_PATH, dtype={"grid_id": str})
     g["grid_id"] = g["grid_id"].str.strip()
     return g
+
+
+@st.cache_data
+def load_dong():
+    if not os.path.exists(DONG_PATH):
+        return None
+    d = pd.read_csv(DONG_PATH, dtype=str).fillna("")
+    d["grid_id"] = d["grid_id"].str.strip()
+    return d
 
 
 def sql_str(s):
@@ -393,12 +405,109 @@ else:
     components.html(map_html, height=650)
 
 # ==========================================
-# 5. 상위 20개 격자
+# 5. 타겟 인구 상위 지역 (주식 히트맵 스타일 트리맵)
 # ==========================================
-st.markdown("### 📊 타겟 인구 상위 20개 격자")
-top20 = merged.sort_values("target_pop", ascending=False).head(20)
-st.dataframe(
-    top20[["grid_id", "pop_label", "lon", "lat"]].rename(
-        columns={"grid_id": "격자 ID", "pop_label": "타겟 인구(명)", "lon": "경도", "lat": "위도"}),
-    hide_index=True,
-)
+TOP_N = 20
+TILE_SCALE = [[0.0, "#2E9E4F"], [0.35, "#FED976"], [0.7, "#FD8D3C"], [1.0, "#D7191C"]]
+
+
+def tile_colors(values):
+    """타일 면적과 같은 값(인구)을 초록->노랑->주황->빨강으로 매핑하고, 글자색(흑/백)도 함께 결정"""
+    lo, hi = min(values), max(values)
+    norm = [(v - lo) / (hi - lo) if hi > lo else 1.0 for v in values]
+    colors = pc.sample_colorscale(TILE_SCALE, norm)
+    fonts = []
+    for c in colors:
+        r, g, b = [int(x) for x in c.replace("rgb(", "").replace(")", "").split(",")]
+        fonts.append("#1b1b1b" if (0.299 * r + 0.587 * g + 0.114 * b) > 150 else "#ffffff")
+    return colors, fonts
+
+
+def build_treemap(top, label_col, value_col, group_col, custom_col, hover_extra):
+    """자치구(구분 헤더) > 행정동(타일) 구조의 트리맵. 타일 면적 = 타겟 인구"""
+    colors, fonts = tile_colors(top[value_col].tolist())
+    groups = top.groupby(group_col)[value_col].sum().sort_values(ascending=False)
+    ids, labels, parents, values, node_colors, node_fonts, custom = [], [], [], [], [], [], []
+    for g_name, g_val in groups.items():
+        ids.append(f"G|{g_name}")
+        labels.append(f"<b>{g_name}</b>")
+        parents.append("")
+        values.append(float(g_val))
+        node_colors.append("#2b303b")
+        node_fonts.append("#ffffff")
+        custom.append(["", ""])
+    for (_, row), c, f in zip(top.iterrows(), colors, fonts):
+        ids.append(f"T|{row['tile_id']}")
+        labels.append(row[label_col])
+        parents.append(f"G|{row[group_col]}")
+        values.append(float(row[value_col]))
+        node_colors.append(c)
+        node_fonts.append(f)
+        custom.append([f"{row[value_col]:,.0f}명", row[custom_col]])
+    fig = go.Figure(go.Treemap(
+        ids=ids, labels=labels, parents=parents, values=values, branchvalues="total",
+        marker=dict(colors=node_colors, line=dict(width=1.5, color="#14171f")),
+        customdata=custom,
+        texttemplate="<b>%{label}</b><br>%{customdata[0]}",
+        textfont=dict(color=node_fonts, size=15),
+        textposition="middle center",
+        hovertemplate="<b>%{label}</b><br>시간당 평균 타겟 인구: %{customdata[0]}<br>" + hover_extra + "<extra></extra>",
+        tiling=dict(pad=3), pathbar=dict(visible=False), sort=True,
+    ))
+    fig.update_layout(margin=dict(t=4, l=4, r=4, b=4), height=560,
+                      paper_bgcolor="rgba(0,0,0,0)", font=dict(family="sans-serif"))
+    return fig
+
+
+st.markdown("### 📊 타겟 인구 상위 지역")
+unit_choice = st.radio("표시 단위", ["격자 개별 (상위 20개 격자)", "행정동 합산 (상위 20개 행정동)"],
+                       horizontal=True, key="rank_unit",
+                       help="격자 개별: 250m 격자 하나가 타일 하나 / 행정동 합산: 같은 행정동의 격자를 모두 더해 타일 하나")
+
+dong_df = load_dong()
+base = merged[["grid_id", "target_pop"]].copy()
+if dong_df is not None:
+    base = base.merge(dong_df, on="grid_id", how="left")
+else:
+    base["sgg"], base["dong"] = "", ""
+base["sgg"] = base["sgg"].fillna("").replace("", "구 미확인")
+base["dong"] = base["dong"].fillna("")
+base.loc[base["dong"] == "", "dong"] = base["grid_id"]  # 매핑이 없으면 격자ID로 대체
+if dong_df is None:
+    st.info("grid_dong.csv가 없어 행정동 대신 격자ID로 표시합니다. 저장소에 grid_dong.csv를 올려주세요.")
+
+all_total = float(base["target_pop"].sum())
+if unit_choice.startswith("격자"):
+    top = base.nlargest(TOP_N, "target_pop").reset_index(drop=True)
+    # 같은 행정동에 속한 격자가 여러 개면 (2), (3) ... 순번을 붙여 구분
+    seq = top.groupby(["sgg", "dong"]).cumcount() + 1
+    cnt = top.groupby(["sgg", "dong"])["dong"].transform("size")
+    top["label"] = [d if c == 1 else f"{d} ({n})" for d, n, c in zip(top["dong"], seq, cnt)]
+    top["tile_id"] = top["grid_id"]
+    fig = build_treemap(top, "label", "target_pop", "sgg", "grid_id", "격자ID: %{customdata[1]}")
+    detail = pd.DataFrame({
+        "순위": range(1, len(top) + 1), "자치구": top["sgg"], "행정동": top["dong"],
+        "격자ID": top["grid_id"], "시간당 평균 타겟 인구(명)": top["target_pop"].round(0).astype(int),
+        "전체 대비 비중(%)": (top["target_pop"] / all_total * 100).round(2),
+    })
+else:
+    agg = (base.groupby(["sgg", "dong"], as_index=False)
+           .agg(target_pop=("target_pop", "sum"), n_grid=("grid_id", "size")))
+    top = agg.nlargest(TOP_N, "target_pop").reset_index(drop=True)
+    top["label"] = top["dong"]
+    top["tile_id"] = top["sgg"] + "/" + top["dong"]
+    top["info"] = top["n_grid"].astype(str) + "개 격자 합산"
+    fig = build_treemap(top, "label", "target_pop", "sgg", "info", "%{customdata[1]}")
+    detail = pd.DataFrame({
+        "순위": range(1, len(top) + 1), "자치구": top["sgg"], "행정동": top["dong"],
+        "합산 격자 수": top["n_grid"], "시간당 평균 타겟 인구(명)": top["target_pop"].round(0).astype(int),
+        "전체 대비 비중(%)": (top["target_pop"] / all_total * 100).round(2),
+    })
+
+top_share = float(top["target_pop"].sum()) / all_total * 100 if all_total else 0
+st.caption(f"타일 면적·색상 = 시간당 평균 타겟 인구 (초록 → 빨강: 많을수록 크고 붉게). "
+           f"상위 {len(top)}개가 전체 타겟 인구의 {top_share:.1f}%를 차지합니다.")
+st.plotly_chart(fig, theme=None, config={"displayModeBar": False})
+
+with st.expander("📋 상세 표 보기"):
+    st.dataframe(detail, hide_index=True)
