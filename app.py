@@ -246,6 +246,17 @@ if merged.empty:
     st.warning("선택한 조건에 해당하는 데이터가 없습니다. (격자ID 불일치 가능)")
     st.stop()
 
+# 지도 툴팁에 표시할 이름: 행정동 (grid_dong.csv가 없으면 격자ID)
+_dong = load_dong()
+if _dong is not None:
+    merged = merged.merge(_dong[["grid_id", "sgg", "dong"]], on="grid_id", how="left")
+    merged["place"] = (merged["sgg"].fillna("") + " " + merged["dong"].fillna("")).str.strip()
+    merged.loc[merged["place"] == "", "place"] = "행정동 미확인"
+    NAME_LABEL = "행정동"
+else:
+    merged["place"] = merged["grid_id"]
+    NAME_LABEL = "격자ID"
+
 # 인구가 적은 순서대로 순위를 매긴 뒤 누적 비율 구간(0-25-50-80-90-100%)으로 5단계 분류
 pct = merged["target_pop"].rank(method="first") / len(merged)
 merged["level"] = pd.cut(pct, bins=LEVEL_BINS, labels=[1, 2, 3, 4, 5], include_lowest=True).astype(int)
@@ -352,8 +363,8 @@ function start(){
     layers:layers,
     getTooltip:function(o){
       const d=o.object;
-      if(!d || d.i===undefined) return null;
-      return {html:'격자ID: '+d.i+'<br>시간당 평균 타겟 인구: '+Number(d.p).toLocaleString()+'명',
+      if(!d || d.n===undefined) return null;
+      return {html:CFG.nameLabel+': '+d.n+'<br>시간당 평균 타겟 인구: '+Number(d.p).toLocaleString()+'명',
               style:{backgroundColor:'rgba(30,30,30,.9)',color:'#fff',fontSize:'12px'}};
     }
   });
@@ -363,17 +374,18 @@ window.addEventListener('load', function(){ if(typeof deck!=='undefined') start(
 
 
 def build_map_html(df, viz, tile_url, dot, pitch, info):
-    cols = ["grid_id", "lon", "lat", "pop_label", "target_pop", "color"]
+    cols = ["place", "lon", "lat", "pop_label", "target_pop", "color"]
     if viz == "column":
         cols.append("elevation")
     records = []
     for r in df[cols].itertuples(index=False):
-        rec = {"i": r[0], "x": round(float(r[1]), 6), "y": round(float(r[2]), 6),
+        rec = {"n": r[0], "x": round(float(r[1]), 6), "y": round(float(r[2]), 6),
                "p": int(r[3]), "w": round(float(r[4]), 2), "c": [int(v) for v in r[5]]}
         if viz == "column":
             rec["e"] = round(float(r[6]), 1)
         records.append(rec)
-    cfg = {"viz": viz, "tileUrl": tile_url, "dot": dot, "heat": dot * 10, "pitch": pitch}
+    cfg = {"viz": viz, "tileUrl": tile_url, "dot": dot, "heat": dot * 10, "pitch": pitch,
+           "nameLabel": NAME_LABEL}
     safe = lambda o: json.dumps(o, ensure_ascii=False, separators=(",", ":")).replace("</", "<\\/")
     return (MAP_HTML.replace("__DATA__", safe(records))
             .replace("__CFG__", safe(cfg))
