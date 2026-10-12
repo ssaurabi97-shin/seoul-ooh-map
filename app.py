@@ -22,6 +22,7 @@ st.set_page_config(
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 GRID_PATH = os.path.join(BASE_DIR, "grid_coords.csv")
 DONG_PATH = os.path.join(BASE_DIR, "grid_dong.csv")  # 격자ID -> 자치구/행정동 (build_grid_dong.py로 생성)
+AREA_PATH = os.path.join(BASE_DIR, "dong_area.csv")  # 자치구/행정동 -> 행정동 면적(㎢)
 WEEKDAYS = ["월", "화", "수", "목", "금", "토", "일"]
 DEFAULT_AGES = ["20-24세", "25-29세", "30-34세", "35-39세"]
 
@@ -81,6 +82,15 @@ def load_dong():
     d = pd.read_csv(DONG_PATH, dtype=str).fillna("")
     d["grid_id"] = d["grid_id"].str.strip()
     return d
+
+
+@st.cache_data
+def load_dong_area():
+    if not os.path.exists(AREA_PATH):
+        return None
+    a = pd.read_csv(AREA_PATH, dtype={"sgg": str, "dong": str})
+    a["area_km2"] = pd.to_numeric(a["area_km2"], errors="coerce")
+    return a.dropna(subset=["area_km2"])
 
 
 def sql_str(s):
@@ -417,14 +427,16 @@ else:
     components.html(map_html, height=650)
 
 # ==========================================
-# 5. 타겟 인구 상위 지역 (주식 히트맵 스타일 트리맵)
+# 5. 타겟 인구 상위 행정동 (주식 히트맵 스타일 트리맵)
 # ==========================================
 TOP_N = 20
 TILE_SCALE = [[0.0, "#2E9E4F"], [0.35, "#FED976"], [0.7, "#FD8D3C"], [1.0, "#D7191C"]]
+RANK_TOTAL = "인구 합계 (행정동 내 타겟 인구 총합)"
+RANK_DENSITY = "면적당 인구 (타겟 인구 ÷ 행정동 면적)"
 
 
 def tile_colors(values):
-    """타일 면적과 같은 값(인구)을 초록->노랑->주황->빨강으로 매핑하고, 글자색(흑/백)도 함께 결정"""
+    """타일 면적과 같은 값을 초록->노랑->주황->빨강으로 매핑하고, 글자색(흑/백)도 함께 결정"""
     lo, hi = min(values), max(values)
     norm = [(v - lo) / (hi - lo) if hi > lo else 1.0 for v in values]
     colors = pc.sample_colorscale(TILE_SCALE, norm)
@@ -435,10 +447,11 @@ def tile_colors(values):
     return colors, fonts
 
 
-def build_treemap(top, label_col, value_col, group_col, custom_col, hover_extra):
-    """자치구(구분 헤더) > 행정동(타일) 구조의 트리맵. 타일 면적 = 타겟 인구"""
+def build_treemap(top, value_col, text_col, hover_col):
+    """자치구(구분 헤더) > 행정동(타일) 구조의 트리맵. 타일 면적·색상 = value_col"""
     colors, fonts = tile_colors(top[value_col].tolist())
-    groups = top.groupby(group_col)[value_col].sum().sort_values(ascending=False)
+    groups = top.groupby("sgg")[value_col].sum().sort_values(ascending=False)
+    counts = top.groupby("sgg").size()
     ids, labels, parents, values, node_colors, node_fonts, custom = [], [], [], [], [], [], []
     for g_name, g_val in groups.items():
         ids.append(f"G|{g_name}")
@@ -447,15 +460,15 @@ def build_treemap(top, label_col, value_col, group_col, custom_col, hover_extra)
         values.append(float(g_val))
         node_colors.append("#2b303b")
         node_fonts.append("#ffffff")
-        custom.append(["", ""])
+        custom.append(["", f"상위 {TOP_N}개 중 {int(counts[g_name])}개 행정동"])
     for (_, row), c, f in zip(top.iterrows(), colors, fonts):
-        ids.append(f"T|{row['tile_id']}")
-        labels.append(row[label_col])
-        parents.append(f"G|{row[group_col]}")
+        ids.append(f"T|{row['sgg']}/{row['dong']}")
+        labels.append(row["dong"])
+        parents.append(f"G|{row['sgg']}")
         values.append(float(row[value_col]))
         node_colors.append(c)
         node_fonts.append(f)
-        custom.append([f"{row[value_col]:,.0f}명", row[custom_col]])
+        custom.append([row[text_col], row[hover_col]])
     fig = go.Figure(go.Treemap(
         ids=ids, labels=labels, parents=parents, values=values, branchvalues="total",
         marker=dict(colors=node_colors, line=dict(width=1.5, color="#14171f")),
@@ -463,7 +476,7 @@ def build_treemap(top, label_col, value_col, group_col, custom_col, hover_extra)
         texttemplate="<b>%{label}</b><br>%{customdata[0]}",
         textfont=dict(color=node_fonts, size=15),
         textposition="middle center",
-        hovertemplate="<b>%{label}</b><br>시간당 평균 타겟 인구: %{customdata[0]}<br>" + hover_extra + "<extra></extra>",
+        hovertemplate="<b>%{label}</b><br>%{customdata[1]}<extra></extra>",
         tiling=dict(pad=3), pathbar=dict(visible=False), sort=True,
     ))
     fig.update_layout(margin=dict(t=4, l=4, r=4, b=4), height=560,
@@ -471,55 +484,77 @@ def build_treemap(top, label_col, value_col, group_col, custom_col, hover_extra)
     return fig
 
 
-st.markdown("### 📊 타겟 인구 상위 지역")
-unit_choice = st.radio("표시 단위", ["격자 개별 (상위 20개 격자)", "행정동 합산 (상위 20개 행정동)"],
-                       horizontal=True, key="rank_unit",
-                       help="격자 개별: 250m 격자 하나가 타일 하나 / 행정동 합산: 같은 행정동의 격자를 모두 더해 타일 하나")
+st.markdown("### 📊 타겟 인구 상위 행정동")
+rank_basis = st.radio(
+    "집계 기준", [RANK_TOTAL, RANK_DENSITY], horizontal=True, key="rank_basis",
+    help="인구 합계: 행정동 안의 250m 격자 타겟 인구(시간당 평균)를 모두 더한 값 / "
+         "면적당 인구: 그 합계를 행정동 면적(㎢)으로 나눈 값(명/㎢)")
 
 dong_df = load_dong()
-base = merged[["grid_id", "target_pop"]].copy()
-if dong_df is not None:
-    base = base.merge(dong_df, on="grid_id", how="left")
-else:
-    base["sgg"], base["dong"] = "", ""
-base["sgg"] = base["sgg"].fillna("").replace("", "구 미확인")
-base["dong"] = base["dong"].fillna("")
-base.loc[base["dong"] == "", "dong"] = base["grid_id"]  # 매핑이 없으면 격자ID로 대체
 if dong_df is None:
-    st.info("grid_dong.csv가 없어 행정동 대신 격자ID로 표시합니다. 저장소에 grid_dong.csv를 올려주세요.")
+    st.warning("grid_dong.csv가 없어 행정동별 집계를 할 수 없습니다. 저장소에 grid_dong.csv를 올려주세요.")
+    st.stop()
 
-all_total = float(base["target_pop"].sum())
-if unit_choice.startswith("격자"):
-    top = base.nlargest(TOP_N, "target_pop").reset_index(drop=True)
-    # 같은 행정동에 속한 격자가 여러 개면 (2), (3) ... 순번을 붙여 구분
-    seq = top.groupby(["sgg", "dong"]).cumcount() + 1
-    cnt = top.groupby(["sgg", "dong"])["dong"].transform("size")
-    top["label"] = [d if c == 1 else f"{d} ({n})" for d, n, c in zip(top["dong"], seq, cnt)]
-    top["tile_id"] = top["grid_id"]
-    fig = build_treemap(top, "label", "target_pop", "sgg", "grid_id", "격자ID: %{customdata[1]}")
-    detail = pd.DataFrame({
-        "순위": range(1, len(top) + 1), "자치구": top["sgg"], "행정동": top["dong"],
-        "격자ID": top["grid_id"], "시간당 평균 타겟 인구(명)": top["target_pop"].round(0).astype(int),
-        "전체 대비 비중(%)": (top["target_pop"] / all_total * 100).round(2),
-    })
+base = merged[["grid_id", "target_pop"]].merge(dong_df[["grid_id", "sgg", "dong"]], on="grid_id", how="left")
+base["sgg"], base["dong"] = base["sgg"].fillna(""), base["dong"].fillna("")
+unmapped = int(((base["sgg"] == "") | (base["dong"] == "")).sum())
+base = base[(base["sgg"] != "") & (base["dong"] != "")]
+
+agg = (base.groupby(["sgg", "dong"], as_index=False)
+       .agg(target_pop=("target_pop", "sum"), n_grid=("grid_id", "size")))
+all_total = float(merged["target_pop"].sum())  # 전체 대비 비중의 분모: 지도에 표시된 모든 격자의 합
+
+area_df = load_dong_area()
+if area_df is not None:
+    agg = agg.merge(area_df[["sgg", "dong", "area_km2"]], on=["sgg", "dong"], how="left")
 else:
-    agg = (base.groupby(["sgg", "dong"], as_index=False)
-           .agg(target_pop=("target_pop", "sum"), n_grid=("grid_id", "size")))
+    agg["area_km2"] = float("nan")
+agg["density"] = agg["target_pop"] / agg["area_km2"]
+
+notes = []
+if rank_basis == RANK_DENSITY:
+    if area_df is None:
+        st.warning("dong_area.csv가 없어 면적당 인구를 계산할 수 없습니다. 저장소에 dong_area.csv를 올려주세요.")
+        st.stop()
+    no_area = int(agg["area_km2"].isna().sum())
+    if no_area:
+        notes.append(f"면적 정보가 없는 행정동 {no_area}개는 제외했습니다.")
+    ranked = agg.dropna(subset=["density"])
+    top = ranked.nlargest(TOP_N, "density").reset_index(drop=True)
+    value_col, unit, basis_text = "density", "명/㎢", "면적당 타겟 인구 (시간당 평균 타겟 인구 ÷ 행정동 면적)"
+else:
     top = agg.nlargest(TOP_N, "target_pop").reset_index(drop=True)
-    top["label"] = top["dong"]
-    top["tile_id"] = top["sgg"] + "/" + top["dong"]
-    top["info"] = top["n_grid"].astype(str) + "개 격자 합산"
-    fig = build_treemap(top, "label", "target_pop", "sgg", "info", "%{customdata[1]}")
-    detail = pd.DataFrame({
-        "순위": range(1, len(top) + 1), "자치구": top["sgg"], "행정동": top["dong"],
-        "합산 격자 수": top["n_grid"], "시간당 평균 타겟 인구(명)": top["target_pop"].round(0).astype(int),
-        "전체 대비 비중(%)": (top["target_pop"] / all_total * 100).round(2),
-    })
+    value_col, unit, basis_text = "target_pop", "명", "행정동 타겟 인구 합계 (시간당 평균)"
+
+if top.empty:
+    st.warning("행정동별로 집계할 데이터가 없습니다. 격자ID가 grid_dong.csv와 일치하는지 확인하세요.")
+    st.stop()
+
+if unmapped:
+    notes.append(f"행정동을 알 수 없는 격자 {unmapped}개는 제외했습니다.")
+
+top["text"] = top[value_col].map(lambda v: f"{v:,.0f}{unit}")
+area_txt = top["area_km2"].map(lambda v: f"{v:,.2f}㎢" if pd.notna(v) else "면적 정보 없음")
+top["hover"] = (top["sgg"] + " · 시간당 평균 타겟 인구 " + top["target_pop"].map(lambda v: f"{v:,.0f}명")
+                + "<br>행정동 면적 " + area_txt
+                + "<br>면적당 " + top["density"].map(lambda v: f"{v:,.0f}명/㎢" if pd.notna(v) else "-")
+                + "<br>" + top["n_grid"].astype(str) + "개 격자 합산")
 
 top_share = float(top["target_pop"].sum()) / all_total * 100 if all_total else 0
-st.caption(f"타일 면적·색상 = 시간당 평균 타겟 인구 (초록 → 빨강: 많을수록 크고 붉게). "
-           f"상위 {len(top)}개가 전체 타겟 인구의 {top_share:.1f}%를 차지합니다.")
-st.plotly_chart(fig, theme=None, config={"displayModeBar": False})
+st.caption(f"타일 면적·색상 = {basis_text} (초록 → 빨강: 클수록 크고 붉게). "
+           f"상위 {len(top)}개 행정동의 타겟 인구 합계는 전체의 {top_share:.1f}%입니다."
+           + ("  \n" + " ".join(notes) if notes else ""))
+st.plotly_chart(build_treemap(top, value_col, "text", "hover"), theme=None, config={"displayModeBar": False})
 
 with st.expander("📋 상세 표 보기"):
+    detail = pd.DataFrame({
+        "순위": range(1, len(top) + 1),
+        "자치구": top["sgg"],
+        "행정동": top["dong"],
+        "합산 격자 수": top["n_grid"],
+        "행정동 면적(㎢)": top["area_km2"].round(2),
+        "시간당 평균 타겟 인구(명)": top["target_pop"].round(0).astype(int),
+        "면적당 타겟 인구(명/㎢)": top["density"].round(0),
+        "전체 대비 비중(%)": (top["target_pop"] / all_total * 100).round(2),
+    })
     st.dataframe(detail, hide_index=True)
