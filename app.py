@@ -173,11 +173,48 @@ theme_map = {"기본 (Base)": "Base", "야간 (Midnight)": "midnight",
 default_start = max(all_dates.min(), all_dates.max() - pd.Timedelta(days=13))
 secret_key = get_setting("VWORLD_API_KEY")
 
+# 기간 빠른 선택: '오늘'이 아니라 DB의 마지막 일자를 종료일로 삼아 시작일을 역산합니다.
+DB_FIRST, DB_LAST = all_dates.min().date(), all_dates.max().date()
+PERIOD_PRESETS = [("지난 3개월", 3), ("지난 6개월", 6), ("지난 1년", 12), ("지난 2년", 24)]
+
+
+def preset_range(months):
+    """종료일 = DB 마지막일, 시작일 = 그날로부터 N개월 전의 다음날 (예: 8/31 기준 3개월 -> 6/1 ~ 8/31)"""
+    end = pd.Timestamp(DB_LAST)
+    start = (end - pd.DateOffset(months=months) + pd.Timedelta(days=1)).date()
+    return max(start, DB_FIRST), DB_LAST
+
+
+def apply_preset(months):
+    # 달력(date_input)의 기본값과 위젯 키를 함께 바꿔서 새 기간이 바로 달력에 반영되게 함
+    st.session_state["period_default"] = preset_range(months)
+    st.session_state["period_rev"] = st.session_state.get("period_rev", 0) + 1
+
+
+st.session_state.setdefault("period_default", (default_start.date(), DB_LAST))
+st.session_state.setdefault("period_rev", 0)
+
+st.sidebar.markdown("### 🎯 분석 조건")
+st.sidebar.caption(f"기간 빠른 선택 (DB 마지막일 {DB_LAST:%Y-%m-%d} 기준)")
+
+
+def preset_button(col, label, months):
+    try:
+        col.button(label, key=f"preset_{months}", on_click=apply_preset, args=(months,), width="stretch")
+    except TypeError:  # width 인자를 모르는 구버전 Streamlit
+        col.button(label, key=f"preset_{months}", on_click=apply_preset, args=(months,), use_container_width=True)
+
+
+# 사이드바 폭이 좁아 한 줄에 4개를 넣으면 글자가 잘리므로 2열 x 2행으로 배치
+for _row in (PERIOD_PRESETS[:2], PERIOD_PRESETS[2:]):
+    for _col, (_label, _months) in zip(st.sidebar.columns(2), _row):
+        preset_button(_col, _label, _months)
+
 with st.sidebar.form("filters"):
-    st.markdown("### 🎯 분석 조건")
     rng = st.date_input("분석 기간 (하루만 보려면 시작일=종료일)",
-                        value=(default_start.date(), all_dates.max().date()),
-                        min_value=all_dates.min().date(), max_value=all_dates.max().date())
+                        value=st.session_state["period_default"],
+                        min_value=DB_FIRST, max_value=DB_LAST,
+                        key=f"period_{st.session_state['period_rev']}")
     wd = st.multiselect("포함할 요일", WEEKDAYS, default=WEEKDAYS)
     time_range = st.slider("시간대 범위 (시)", 0, 23, (8, 23))
     selected_gender = st.selectbox("성별", ["전체", "여성", "남성"])
@@ -190,6 +227,14 @@ with st.sidebar.form("filters"):
     form_key = "" if secret_key else st.text_input("브이월드 API 키", type="password")
 
     submitted = st.form_submit_button("🔍 실행하기", type="primary")
+
+# Streamlit 달력에 내장된 'Past 3 Months' 등 빠른 선택은 '오늘' 기준으로 고정되어 있어
+# DB 마지막일(예: 8/31)과 어긋나므로 숨기고, 위의 DB 기준 버튼을 사용합니다.
+st.sidebar.markdown(
+    "<style>[data-testid='stDateInputQuickSelect'],"
+    ".stDateInputQuickSelectPopover{display:none !important;}</style>",
+    unsafe_allow_html=True,
+)
 
 if submitted:
     st.session_state["params"] = dict(
